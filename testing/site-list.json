@@ -1,0 +1,85 @@
+[
+  {"url": "https://the-internet.herokuapp.com/login", "category": "test-practice", "note": "login form"},
+  {"url": "https://www.saucedemo.com/", "category": "test-practice", "note": "login form"},
+  {"url": "https://practice.expandtesting.com/login", "category": "test-practice", "note": "login form"},
+  {"url": "https://demoqa.com/automation-practice-form", "category": "test-practice", "note": "rich registration form"},
+  {"url": "https://demoqa.com/login", "category": "test-practice", "note": "login form"},
+  {"url": "https://formy-project.herokuapp.com/form", "category": "test-practice", "note": "non-sensitive form, should detect nothing"},
+  {"url": "https://parabank.parasoft.com/parabank/register.htm", "category": "test-practice", "note": "includes SSN field"},
+  {"url": "https://practicetestautomation.com/practice-test-login/", "category": "test-practice", "note": "login form"},
+  {"url": "https://seleniumbase.io/realworld/login", "category": "test-practice", "note": "login form"},
+  {"url": "https://opensource-demo.orangehrmlive.com/web/index.php/auth/login", "category": "real-product-demo", "note": "HR system login"},
+  {"url": "https://www.automationexercise.com/login", "category": "real-product-demo", "note": "e-commerce login/signup"},
+
+  {"url": "https://www.w3schools.com/registration/", "category": "cms-docs", "note": "registration form example"},
+  {"url": "https://www.wikipedia.org/wiki/Special:CreateAccount", "category": "cms-docs", "note": "Wikipedia account creation - real production form"},
+  {"url": "https://en.wikipedia.org/wiki/Special:UserLogin", "category": "cms-docs", "note": "Wikipedia login - real production form"},
+  {"url": "https://stackoverflow.com/users/signup", "category": "cms-docs", "note": "Stack Overflow signup"},
+  {"url": "https://github.com/signup", "category": "cms-docs", "note": "GitHub signup - name/email/password"},
+  {"url": "https://gitlab.com/users/sign_up", "category": "cms-docs", "note": "GitLab signup"},
+  {"url": "https://www.reddit.com/register/", "category": "cms-docs", "note": "Reddit signup"},
+
+  {"url": "https://www.mit.edu/contact/", "category": "university", "note": "university contact form"},
+  {"url": "https://www.harvard.edu/contact/", "category": "university", "note": "university contact form"},
+  {"url": "https://www.ox.ac.uk/", "category": "university", "note": "university site, check for search/contact fields"},
+  {"url": "https://www.iitb.ac.in/", "category": "university", "note": "Indian university site"},
+  {"url": "https://www.du.ac.in/", "category": "university", "note": "Delhi University site"},
+
+  {"url": "https://www.usa.gov/", "category": "government", "note": "US government portal"},
+  {"url": "https://www.gov.uk/contact", "category": "government", "note": "UK government contact"},
+  {"url": "https://www.india.gov.in/", "category": "government", "note": "Indian government portal"},
+  {"url": "https://www.irs.gov/help/contact-my-local-office-in-california", "category": "government", "note": "government contact form"},
+
+  {"url": "https://wordpress.org/support/", "category": "open-source", "note": "WordPress support/search"},
+  {"url": "https://www.python.org/accounts/register/", "category": "open-source", "note": "Python.org account registration"},
+  {"url": "https://pypi.org/account/register/", "category": "open-source", "note": "PyPI registration - name, email, password"},
+  {"url": "https://www.npmjs.com/signup", "category": "open-source", "note": "npm signup"},
+  {"url": "https://hub.docker.com/signup", "category": "open-source", "note": "Docker Hub signup"},
+  {"url": "https://www.mozilla.org/en-US/contact/", "category": "open-source", "note": "Mozilla contact form"},
+
+  {"url": "https://mailchimp.com/signup/", "category": "saas", "note": "Mailchimp signup"},
+  {"url": "https://slack.com/get-started", "category": "saas", "note": "Slack signup flow"},
+  {"url": "https://trello.com/signup", "category": "saas", "note": "Trello signup"},
+  {"url": "https://asana.com/create-account", "category": "saas", "note": "Asana signup"},
+  {"url": "https://www.notion.so/signup", "category": "saas", "note": "Notion signup"},
+  {"url": "https://airtable.com/signup", "category": "saas", "note": "Airtable signup"},
+  {"url": "https://www.figma.com/signup", "category": "saas", "note": "Figma signup"},
+  {"url": "https://www.canva.com/signup/", "category": "saas", "note": "Canva signup"},
+  {"url": "https://www.dropbox.com/register", "category": "saas", "note": "Dropbox signup"},
+
+  {"url": "https://www.coursera.org/", "category": "edtech", "note": "education platform, check search/newsletter"},
+  {"url": "https://www.khanacademy.org/join", "category": "edtech", "note": "Khan Academy signup"},
+  {"url": "https://www.duolingo.com/", "category": "edtech", "note": "language learning signup" },
+
+  {"url": "https://www.bbc.com/contact", "category": "media", "note": "BBC contact form"},
+  {"url": "https://www.nytimes.com/subscription", "category": "media", "note": "NYT subscription form"},
+  {"url": "https://www.theguardian.com/help/contact-us", "category": "media", "note": "Guardian contact form"},
+
+  {"url": "https://www.eventbrite.com/signup/", "category": "consumer", "note": "Eventbrite signup"},
+  {"url": "https://www.meetup.com/login/", "category": "consumer", "note": "Meetup login"},
+  {"url": "https://www.goodreads.com/user/sign_up", "category": "consumer", "note": "Goodreads signup"},
+  {"url": "https://www.imdb.com/registration/", "category": "consumer", "note": "IMDb registration"},
+
+  {"url": "https://about.me/join", "category": "consumer", "note": "personal profile signup"},
+  {"url": "https://www.wordpress.com/start/", "category": "cms-docs", "note": "WordPress.com signup flow"},
+  {"url": "https://www.squarespace.com/signup", "category": "cms-docs", "note": "Squarespace signup"},
+  {"url": "https://www.wix.com/signup", "category": "cms-docs", "note": "Wix signup"},
+
+  {"url": "https://www.udemy.com/join/signup-popup/", "category": "edtech", "note": "Udemy signup"},
+  {"url": "https://www.skillshare.com/signup", "category": "edtech", "note": "Skillshare signup"},
+
+  {"url": "https://www.behance.net/signup", "category": "creative", "note": "Behance signup"},
+  {"url": "https://dribbble.com/signup", "category": "creative", "note": "Dribbble signup"},
+  {"url": "https://unsplash.com/join", "category": "creative", "note": "Unsplash signup"},
+
+  {"url": "https://www.freecodecamp.org/email-signup", "category": "edtech", "note": "freeCodeCamp signup"},
+  {"url": "https://www.codecademy.com/join", "category": "edtech", "note": "Codecademy signup"},
+  {"url": "https://leetcode.com/accounts/signup/", "category": "edtech", "note": "LeetCode signup"},
+  {"url": "https://www.hackerrank.com/register", "category": "edtech", "note": "HackerRank registration"},
+
+  {"url": "https://www.producthunt.com/", "category": "consumer", "note": "Product Hunt, check newsletter/signup"},
+  {"url": "https://www.indiehackers.com/", "category": "consumer", "note": "Indie Hackers, check signup"},
+
+  {"url": "https://practice.automationtesting.in/my-account/", "category": "test-practice", "note": "known broken - WordPress error, kept for regression tracking"},
+  {"url": "https://demo.opencart.com/index.php?route=account/register", "category": "test-practice", "note": "known Cloudflare-blocked, kept for regression tracking"}
+]
