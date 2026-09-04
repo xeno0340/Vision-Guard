@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>VisionGuard</title>
+  <style>
+    body {
+      width: 360px;
+      padding: 16px;
+      font-family: -apple-system, "Segoe UI", sans-serif;
+      background: #1e1e1e;
+      color: #e8e8e8;
+    }
+    h1 {
+      font-size: 15px;
+      margin: 0 0 4px 0;
+    }
+    p.subtitle {
+      font-size: 12px;
+      color: #999;
+      margin: 0 0 14px 0;
+    }
+    button {
+      width: 100%;
+      padding: 10px;
+      font-size: 13px;
+      background: #378ADD;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #2c6fb0;
+    }
+    button:disabled {
+      background: #555;
+      cursor: not-allowed;
+    }
+    #status {
+      font-size: 12px;
+      color: #999;
+      margin-top: 10px;
+      min-height: 16px;
+    }
+    #preview-container {
+      margin-top: 12px;
+      border: 1px solid #444;
+      border-radius: 6px;
+      overflow: hidden;
+      display: none;
+    }
+    #preview-container.visible {
+      display: block;
+    }
+    #preview {
+      width: 100%;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <h1>VisionGuard</h1>
+  <p class="subtitle">Step 2: capture the current tab</p>
+
+  <button id="captureBtn">Capture current screen</button>
+  <button id="detectBtn" style="margin-top: 8px;">Detect sensitive fields</button>
+  <button id="redactBtn" style="margin-top: 8px;">Redact and preview</button>
+  <div id="status"></div>
+
+  <div id="preview-container">
+    <img id="preview" alt="Captured screenshot preview">
+  </div>
+
+  <div id="redacted-container" style="margin-top: 10px; display: none;">
+    <canvas id="redactedCanvas" style="width: 100%; border: 1px solid #444; border-radius: 6px;"></canvas>
+  </div>
+
+  <textarea id="taskInput" placeholder="What should the agent do? e.g. 'log in'"
+    style="width: 100%; margin-top: 10px; padding: 8px; box-sizing: border-box;
+           background: #2a2a2a; color: #e8e8e8; border: 1px solid #444;
+           border-radius: 6px; font-family: inherit; font-size: 12px; resize: vertical;"
+    rows="2"></textarea>
+
+  <button id="sendBtn" style="margin-top: 8px;">Send redacted image to server</button>
+  <button id="executeBtn" style="margin-top: 8px; background: #1D9E75;">Execute returned action</button>
+
+  <div id="serverResponse" style="margin-top: 10px; font-size: 12px; white-space: pre-wrap;"></div>
+
+  <div id="fields-container" style="margin-top: 10px; font-size: 12px;"></div>
+
+  <script src="lib/ort.min.js"></script>
+  <script src="face-detector.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

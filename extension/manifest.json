@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "VisionGuard",
+  "version": "0.1.0",
+  "description": "Privacy-preserving vision agent - captures and redacts screen content locally before any server call.",
+
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "scripting"
+  ],
+
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+
+  "host_permissions": [
+    "http://localhost:8000/*"
+  ],
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "VisionGuard"
+  },
+
+  "background": {
+    "service_worker": "background.js"
+  }
+}
