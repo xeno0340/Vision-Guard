@@ -17,6 +17,29 @@ let lastActualDevicePixelRatio = 1; // kept separate - used to convert server bb
 let lastActionResponse = null; // the server's last returned action, for the execute step
 let lastClickableElements = null; // Set-of-Mark: numbered clickable elements for the model to choose from
 
+// Type-preserving redaction: generates a realistic, structurally valid
+// placeholder for a given field type, so the redacted image still
+// conveys "this is where an email/phone/card number goes" without ever
+// containing the real value. Values are deliberately well-known
+// test/placeholder patterns (e.g. a standard Luhn-valid test card
+// number), not randomly generated data that could coincidentally
+// resemble something real.
+function generateFakeValue(fakeType) {
+  const FAKE_VALUES = {
+    password: "••••••••••",
+    email: "user@example.com",
+    phone: "(555) 123-4567",
+    name: "Jordan Smith",
+    dob: "01/15/1990",
+    address: "123 Main Street",
+    card_number: "4111 1111 1111 1111", // standard Luhn-valid test card number
+    expiry: "12/29",
+    cvv: "123",
+    government_id: "XXX-XX-1234",
+  };
+  return FAKE_VALUES[fakeType] || "[redacted]";
+}
+
 // Loads a data URL into an actual <img> element (BlazeFace needs a real
 // DOM image/canvas to read pixels from, not just a base64 string) and
 // runs detectFaces() on it, from face-detector.js.
@@ -68,6 +91,7 @@ detectBtn.addEventListener("click", async () => {
     // consistent coordinate space: device pixels, matching the screenshot.
     const domFieldsScaled = fields.map((f) => ({
       category: f.category,
+      fakeType: f.fakeType,
       x: Math.round(f.x * devicePixelRatio),
       y: Math.round(f.y * devicePixelRatio),
       width: Math.round(f.width * devicePixelRatio),
@@ -180,14 +204,39 @@ redactBtn.addEventListener("click", async () => {
     const ctx = redactedCanvas.getContext("2d");
     ctx.drawImage(img, 0, 0);
 
-    // Black out each sensitive field, scaled from CSS px to device px.
-    ctx.fillStyle = "#000000";
+    // Type-preserving redaction: DOM-detected fields (which carry a
+    // fakeType) get a realistic placeholder VALUE drawn over them, not
+    // a blank blackout - so the downstream model can still tell "this
+    // is where a phone number goes" without ever seeing the real one.
+    // Faces (from face-detector.js, no fakeType) have no meaningful
+    // "fake face" to draw, so they stay a solid blackout.
     lastDetectedFields.forEach((field) => {
       const x = field.x * lastDevicePixelRatio;
       const y = field.y * lastDevicePixelRatio;
       const w = field.width * lastDevicePixelRatio;
       const h = field.height * lastDevicePixelRatio;
+
+      if (field.category === "face" || !field.fakeType) {
+        ctx.fillStyle = "#000000";
+        ctx.fillRect(x, y, w, h);
+        return;
+      }
+
+      // Field-shaped background (light gray, like a typical input box)
+      // so the fake value reads as "a filled-in form field", not a
+      // random floating string.
+      ctx.fillStyle = "#F0F0F0";
       ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = "#CCCCCC";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x, y, w, h);
+
+      const fakeValue = generateFakeValue(field.fakeType);
+      const fontSize = Math.max(10, Math.min(h * 0.5, 16)) * lastDevicePixelRatio;
+      ctx.font = `${fontSize}px sans-serif`;
+      ctx.fillStyle = "#333333";
+      ctx.textBaseline = "middle";
+      ctx.fillText(fakeValue, x + 6 * lastDevicePixelRatio, y + h / 2, w - 12 * lastDevicePixelRatio);
     });
 
     // Draw numbered labels for every clickable element (Set-of-Mark),
