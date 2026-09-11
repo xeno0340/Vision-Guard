@@ -76,6 +76,17 @@
     <canvas id="redactedCanvas" style="width: 100%; border: 1px solid #444; border-radius: 6px;"></canvas>
   </div>
 
+  <div style="margin-top: 14px; padding: 10px; background: #252525; border-radius: 6px; border: 1px solid #444;">
+    <div style="font-size: 12px; font-weight: bold; margin-bottom: 6px;">Vault (local only, never transmitted)</div>
+    <input id="vaultName" placeholder="Name" style="width: 100%; margin-bottom: 4px; padding: 6px; background: #2a2a2a; color: #e8e8e8; border: 1px solid #444; border-radius: 4px; font-size: 12px; box-sizing: border-box;">
+    <input id="vaultEmail" placeholder="Email" style="width: 100%; margin-bottom: 4px; padding: 6px; background: #2a2a2a; color: #e8e8e8; border: 1px solid #444; border-radius: 4px; font-size: 12px; box-sizing: border-box;">
+    <input id="vaultPhone" placeholder="Phone" style="width: 100%; margin-bottom: 4px; padding: 6px; background: #2a2a2a; color: #e8e8e8; border: 1px solid #444; border-radius: 4px; font-size: 12px; box-sizing: border-box;">
+    <input id="vaultAddress" placeholder="Address" style="width: 100%; margin-bottom: 4px; padding: 6px; background: #2a2a2a; color: #e8e8e8; border: 1px solid #444; border-radius: 4px; font-size: 12px; box-sizing: border-box;">
+    <input id="vaultPassword" type="password" placeholder="Password" style="width: 100%; margin-bottom: 6px; padding: 6px; background: #2a2a2a; color: #e8e8e8; border: 1px solid #444; border-radius: 4px; font-size: 12px; box-sizing: border-box;">
+    <button id="saveVaultBtn" style="width: 100%; padding: 6px; font-size: 12px;">Save to Vault</button>
+    <div id="vaultStatus" style="font-size: 11px; color: #999; margin-top: 4px;"></div>
+  </div>
+
   <textarea id="taskInput" placeholder="What should the agent do? e.g. 'log in'"
     style="width: 100%; margin-top: 10px; padding: 8px; box-sizing: border-box;
            background: #2a2a2a; color: #e8e8e8; border: 1px solid #444;
@@ -84,6 +95,7 @@
 
   <button id="sendBtn" style="margin-top: 8px;">Send redacted image to server</button>
   <button id="executeBtn" style="margin-top: 8px; background: #1D9E75;">Execute returned action</button>
+  <button id="runTaskBtn" style="margin-top: 12px; background: #7F77DD; font-weight: bold;">▶ Run Task (auto, multi-step)</button>
 
   <div id="serverResponse" style="margin-top: 10px; font-size: 12px; white-space: pre-wrap;"></div>
 
@@ -91,6 +103,7 @@
 
   <script src="lib/ort.min.js"></script>
   <script src="face-detector.js"></script>
+  <script src="vault.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>
