@@ -60,6 +60,11 @@ class ActionResponse(BaseModel):
     note: str
     error_detected: bool = False
     error_message: str | None = None
+    error_category: str | None = None  # coarse classification of WHY an error occurred, when one is
+                                        # detected - see build_prompt for the fixed category set. This
+                                        # is diagnostic information surfaced to the human, NOT a basis
+                                        # for autonomous retry with a different strategy; the loop still
+                                        # stops on any detected error, same as before this change.
     rejected: bool = False  # True when action=="none" because the model's response was invalid,
                              # NOT because the task is genuinely complete - these are different
                              # outcomes and must not be reported to the user identically.
@@ -144,7 +149,7 @@ def build_prompt(task_instruction: str, elements: list[ClickableElement]) -> str
         '- "click": click a clickable element. Requires element_id.\n'
         '- "type": fill a fillable text field. Requires element_id AND '
         "value_type. If the element's type is shown as a specific value "
-        "(name/email/phone/address/password), value_type MUST exactly "
+        "(name/username/first_name/last_name/email/phone/address/password), value_type MUST exactly "
         "match it. If the element's type is shown as UNKNOWN, read its "
         "label text and decide for yourself which of these five "
         "categories it corresponds to (name/email/phone/address/"
@@ -158,13 +163,43 @@ def build_prompt(task_instruction: str, elements: list[ClickableElement]) -> str
         "Respond with ONLY a JSON object, no other text, in exactly this "
         "format:\n"
         '{"action": "click"|"type"|"none", "element_id": <number or null>, '
-        '"value_type": "name"|"email"|"phone"|"address"|"password"|null, '
+        '"value_type": "name"|"username"|"first_name"|"last_name"|"email"|"phone"|"address"|"password"|null, '
         '"reasoning": "one short sentence", "error_detected": false, '
-        '"error_message": null}\n\n'
+        '"error_message": null, "error_category": null}\n\n'
         'If you see an error/warning message on the page, set '
-        '"error_detected": true and put the exact or paraphrased error '
-        'text in "error_message", regardless of what action you choose.'
+        '"error_detected": true, put the exact or paraphrased error '
+        'text in "error_message", and classify WHY it likely occurred '
+        'into exactly one of these categories for "error_category": '
+        '"validation_format_error" (input didn\'t match a required '
+        'format/rule), "wrong_credentials" (login rejected as incorrect), '
+        '"already_exists_conflict" (e.g. username/email already taken), '
+        '"network_or_loading_issue" (page failed to load or timed out), '
+        'or "unknown" (none of the above clearly apply). This '
+        "classification is for informing the human user what went wrong - "
+        "it does not mean you should try a different action; still "
+        "report it and stop, regardless of what action you choose."
     )
+
+
+ERROR_CATEGORIES = {
+    "validation_format_error",
+    "wrong_credentials",
+    "already_exists_conflict",
+    "network_or_loading_issue",
+    "unknown",
+}
+
+
+def _validate_error_category(category: str | None) -> str | None:
+    """
+    Keeps error_category to the fixed set named in the prompt - if the
+    model returns something outside it (or nothing), fall back to
+    "unknown" rather than passing an arbitrary, unvalidated string
+    through to the user.
+    """
+    if category is None:
+        return None
+    return category if category in ERROR_CATEGORIES else "unknown"
 
 
 def parse_model_response(raw_text: str) -> dict:
@@ -237,7 +272,7 @@ def agent_step(ctx: RedactedContext):
                     note=f"[Qwen2.5-VL local] Model tried to type into element_id "
                          f"{element_id}, which is not a fillable field. Rejected.",
                 )
-            KNOWN_VALUE_TYPES = {"name", "email", "phone", "address", "password"}
+            KNOWN_VALUE_TYPES = {"name", "username", "first_name", "last_name", "email", "phone", "address", "password"}
 
             if target.fillableType is not None:
                 # We had a confident regex-based guess for this field -
@@ -284,6 +319,7 @@ def agent_step(ctx: RedactedContext):
             note=f"[Qwen2.5-VL local] {parsed.get('reasoning', 'no reasoning given')}",
             error_detected=bool(parsed.get("error_detected", False)),
             error_message=parsed.get("error_message"),
+            error_category=_validate_error_category(parsed.get("error_category")),
         )
 
     except requests.exceptions.ConnectionError:

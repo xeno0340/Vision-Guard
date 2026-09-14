@@ -10,6 +10,17 @@
 // sensitive-field and clickable-element detection elsewhere in this
 // system - one consistent design pattern, not a new one.
 
+function queryAllDeep(selector, root) {
+  root = root || document;
+  const results = Array.from(root.querySelectorAll(selector));
+  root.querySelectorAll("*").forEach((el) => {
+    if (el.shadowRoot) {
+      results.push(...queryAllDeep(selector, el.shadowRoot));
+    }
+  });
+  return results;
+}
+
 function detectPageErrors() {
   const ERROR_KEYWORDS = [
     "incorrect", "invalid", "failed", "failure", "error",
@@ -28,9 +39,7 @@ function detectPageErrors() {
 
   const ERROR_CLASS_HINTS = /error|alert|danger|warn|invalid|fail/i;
 
-  const candidates = document.querySelectorAll(
-    "div, p, span, li, small, strong, b"
-  );
+  const candidates = queryAllDeep("div, p, span, li, small, strong, b");
 
   for (const el of candidates) {
     // Only look at leaf-ish, visible, currently-rendered text nodes -
@@ -84,7 +93,7 @@ function detectPageSuccess() {
     "successfully registered", "successfully signed up",
   ];
 
-  const candidates = document.querySelectorAll("div, p, span, li, h1, h2, h3");
+  const candidates = queryAllDeep("div, p, span, li, h1, h2, h3");
 
   for (const el of candidates) {
     if (el.children.length > 2) continue;

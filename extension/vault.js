@@ -21,7 +21,7 @@ const VAULT_STORAGE_KEY = "visionguard_vault";
 // documentation. Before any real deployment, this should be removed
 // and password fields should go back to requiring manual human entry
 // every time, with no vault-based autofill path at all.
-const VAULT_FIELDS = ["name", "email", "phone", "address", "password"];
+const VAULT_FIELDS = ["name", "username", "email", "phone", "address", "password"];
 
 async function getVault() {
   const result = await chrome.storage.local.get(VAULT_STORAGE_KEY);

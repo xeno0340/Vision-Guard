@@ -22,6 +22,22 @@ const fieldsContainer = document.getElementById("fields-container");
 const redactBtn = document.getElementById("redactBtn");
 const redactedContainer = document.getElementById("redacted-container");
 const redactedCanvas = document.getElementById("redactedCanvas");
+const viewFullSizeBtn = document.getElementById("viewFullSizeBtn");
+
+// Extension popups are physically tiny (~380px wide) and can't be
+// zoomed/panned the way a normal browser tab can - the redacted
+// preview canvas is drawn at real screenshot resolution but always
+// LOOKS blurry when squeezed into that small a space, purely from CSS
+// downscaling, not because the underlying image is actually low-res.
+// Opening the same image at full size in a real tab fixes this.
+viewFullSizeBtn.addEventListener("click", () => {
+  if (redactedCanvas.width === 0) {
+    alert("Nothing to view yet - run Redact and preview first.");
+    return;
+  }
+  const dataUrl = redactedCanvas.toDataURL("image/png");
+  chrome.tabs.create({ url: dataUrl });
+});
 const executeBtn = document.getElementById("executeBtn");
 const taskInput = document.getElementById("taskInput");
 const sendBtn = document.getElementById("sendBtn");
@@ -32,6 +48,7 @@ const runTaskBtn = document.getElementById("runTaskBtn");
 // vault.js (loaded via <script> tag in popup.html, same context as this
 // file - not injected into the page) provides getVault/saveVault.
 const vaultNameInput = document.getElementById("vaultName");
+const vaultUsernameInput = document.getElementById("vaultUsername");
 const vaultEmailInput = document.getElementById("vaultEmail");
 const vaultPhoneInput = document.getElementById("vaultPhone");
 const vaultAddressInput = document.getElementById("vaultAddress");
@@ -42,6 +59,7 @@ const vaultStatusEl = document.getElementById("vaultStatus");
 async function loadVaultIntoUI() {
   const vault = await getVault();
   vaultNameInput.value = vault.name || "";
+  vaultUsernameInput.value = vault.username || "";
   vaultEmailInput.value = vault.email || "";
   vaultPhoneInput.value = vault.phone || "";
   vaultAddressInput.value = vault.address || "";
@@ -52,6 +70,7 @@ loadVaultIntoUI();
 saveVaultBtn.addEventListener("click", async () => {
   const saved = await saveVault({
     name: vaultNameInput.value.trim(),
+    username: vaultUsernameInput.value.trim(),
     email: vaultEmailInput.value.trim(),
     phone: vaultPhoneInput.value.trim(),
     address: vaultAddressInput.value.trim(),
@@ -76,20 +95,112 @@ let lastActualDevicePixelRatio = 1;
 let lastActionResponse = null;
 let lastClickableElements = null;
 
+// Computes a valid Luhn check digit for a partial card number, so
+// generated card numbers pass the same checksum real ones do (still
+// entirely fake - random digits, not a real account).
+function luhnCheckDigit(partialDigits) {
+  let sum = 0;
+  let alternate = true;
+  for (let i = partialDigits.length - 1; i >= 0; i--) {
+    let digit = parseInt(partialDigits[i], 10);
+    if (alternate) {
+      digit *= 2;
+      if (digit > 9) digit -= 9;
+    }
+    sum += digit;
+    alternate = !alternate;
+  }
+  return (10 - (sum % 10)) % 10;
+}
+
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+// Generates a fresh, randomized-but-realistic placeholder each call,
+// rather than the same fixed value every time. A previous version used
+// one static value per category - functionally fine for preserving
+// semantic role, but a further refinement worth having: varied output
+// is less fingerprintable and better demonstrates that these are
+// generated placeholders, not a single hardcoded stand-in.
 function generateFakeValue(fakeType) {
-  const FAKE_VALUES = {
-    password: "••••••••••",
-    email: "user@example.com",
-    phone: "(555) 123-4567",
-    name: "Jordan Smith",
-    dob: "01/15/1990",
-    address: "123 Main Street",
-    card_number: "4111 1111 1111 1111",
-    expiry: "12/29",
-    cvv: "123",
-    government_id: "XXX-XX-1234",
-  };
-  return FAKE_VALUES[fakeType] || "[redacted]";
+  const FIRST_NAMES = ["Jordan", "Taylor", "Morgan", "Casey", "Riley", "Alex", "Sam", "Jamie"];
+  const LAST_NAMES = ["Smith", "Johnson", "Williams", "Brown", "Davis", "Miller", "Wilson"];
+  const STREET_NAMES = ["Main Street", "Oak Avenue", "Maple Drive", "Cedar Lane", "Park Road", "Elm Street"];
+  const EMAIL_DOMAINS = ["example.com", "example.org", "example.net"];
+
+  switch (fakeType) {
+    case "password":
+      return "•".repeat(randomInt(8, 14));
+
+    case "name": {
+      const first = FIRST_NAMES[randomInt(0, FIRST_NAMES.length - 1)];
+      const last = LAST_NAMES[randomInt(0, LAST_NAMES.length - 1)];
+      return `${first} ${last}`;
+    }
+
+    case "first_name":
+      return FIRST_NAMES[randomInt(0, FIRST_NAMES.length - 1)];
+
+    case "last_name":
+      return LAST_NAMES[randomInt(0, LAST_NAMES.length - 1)];
+
+    case "email": {
+      const first = FIRST_NAMES[randomInt(0, FIRST_NAMES.length - 1)].toLowerCase();
+      const num = randomInt(10, 999);
+      const domain = EMAIL_DOMAINS[randomInt(0, EMAIL_DOMAINS.length - 1)];
+      return `${first}${num}@${domain}`;
+    }
+
+    case "phone": {
+      // 555 exchange is reserved for fictional use in North American
+      // numbering - guarantees the generated number is never dialable,
+      // regardless of which area code and last four digits are randomized.
+      const areaCode = randomInt(200, 999);
+      const lastFour = String(randomInt(0, 9999)).padStart(4, "0");
+      return `(${areaCode}) 555-${lastFour}`;
+    }
+
+    case "dob": {
+      const month = String(randomInt(1, 12)).padStart(2, "0");
+      const day = String(randomInt(1, 28)).padStart(2, "0");
+      const year = randomInt(1960, 2004); // plausible adult age range
+      return `${month}/${day}/${year}`;
+    }
+
+    case "address": {
+      const num = randomInt(100, 9999);
+      const street = STREET_NAMES[randomInt(0, STREET_NAMES.length - 1)];
+      return `${num} ${street}`;
+    }
+
+    case "card_number": {
+      // Random 15-digit prefix + computed Luhn check digit - structurally
+      // valid (passes the same checksum real cards use) without being
+      // any real account number, and different every time rather than
+      // always the same well-known test number.
+      let digits = "4"; // Visa-style leading digit, matches common test-card conventions
+      for (let i = 0; i < 14; i++) digits += randomInt(0, 9);
+      const checkDigit = luhnCheckDigit(digits);
+      const fullNumber = digits + checkDigit;
+      return fullNumber.match(/.{1,4}/g).join(" ");
+    }
+
+    case "expiry": {
+      const month = String(randomInt(1, 12)).padStart(2, "0");
+      const year = randomInt(26, 31); // a few years out from a 2026 baseline
+      return `${month}/${year}`;
+    }
+
+    case "cvv":
+      return String(randomInt(0, 999)).padStart(3, "0");
+
+    case "government_id":
+      return `XXX-XX-${String(randomInt(0, 9999)).padStart(4, "0")}`;
+
+    default:
+      return "[redacted]";
+  }
 }
 
 function detectFacesInDataUrl(dataUrl) {
@@ -108,7 +219,27 @@ function detectFacesInDataUrl(dataUrl) {
 }
 
 function executeClickByElementId(elementId) {
-  const el = document.querySelector(`[data-visionguard-id="${elementId}"]`);
+  // Self-contained deep query - this function is injected standalone
+  // via func:, not alongside the detector files, so it can't reference
+  // their queryOneDeep/queryAllDeep helpers and needs its own copy.
+  // Real bug found: detection could already see elements inside an
+  // open shadow root (queryAllDeep), but execution still used a plain
+  // document.querySelector and could never find what detection found.
+  function findDeep(selector, root) {
+    root = root || document;
+    const direct = root.querySelector(selector);
+    if (direct) return direct;
+    const hosts = root.querySelectorAll("*");
+    for (const h of hosts) {
+      if (h.shadowRoot) {
+        const found = findDeep(selector, h.shadowRoot);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  const el = findDeep(`[data-visionguard-id="${elementId}"]`);
   if (!el) {
     return { success: false, reason: `No element found with id ${elementId} (page may have changed since detection)` };
   }
@@ -130,7 +261,21 @@ function executeClickByElementId(elementId) {
 // register the change - just setting .value directly is invisible to
 // most modern form-handling code.
 function executeFillByElementId(elementId, value) {
-  const el = document.querySelector(`[data-visionguard-id="${elementId}"]`);
+  function findDeep(selector, root) {
+    root = root || document;
+    const direct = root.querySelector(selector);
+    if (direct) return direct;
+    const hosts = root.querySelectorAll("*");
+    for (const h of hosts) {
+      if (h.shadowRoot) {
+        const found = findDeep(selector, h.shadowRoot);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  const el = findDeep(`[data-visionguard-id="${elementId}"]`);
   if (!el) {
     return { success: false, reason: `No element found with id ${elementId} (page may have changed since detection)` };
   }
@@ -172,12 +317,15 @@ async function doCapture() {
   return dataUrl;
 }
 
-async function doDetect() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+async function doDetect(tabId) {
+  if (tabId === undefined) {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    tabId = tab.id;
+  }
 
-  await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["dom-detector.js"] });
+  await chrome.scripting.executeScript({ target: { tabId }, files: ["dom-detector.js"] });
   const [domResult] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+    target: { tabId },
     func: () => detectSensitiveFields(),
   });
   const { fields, devicePixelRatio } = domResult.result;
@@ -201,9 +349,9 @@ async function doDetect() {
   lastDetectedFields = allFields;
   lastDevicePixelRatio = 1;
 
-  await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["clickable-detector.js"] });
+  await chrome.scripting.executeScript({ target: { tabId }, files: ["clickable-detector.js"] });
   const [clickableResult] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+    target: { tabId },
     func: () => detectClickableElements(),
   });
   lastClickableElements = clickableResult.result.elements;
@@ -307,10 +455,13 @@ async function doSend(taskInstruction) {
   return data;
 }
 
-async function doExecute(elementId) {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+async function doExecute(elementId, tabId) {
+  if (tabId === undefined) {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    tabId = tab.id;
+  }
   const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+    target: { tabId },
     func: executeClickByElementId,
     args: [elementId],
   });
@@ -322,17 +473,37 @@ async function doExecute(elementId) {
 // value for the requested type - the caller decides how to handle that
 // (currently: stop and prompt the human, never guess or leave blank
 // silently).
-async function doFill(elementId, valueType) {
+async function doFill(elementId, valueType, tabId) {
   const vault = await getVault();
-  const value = vault[valueType];
 
-  if (!value) {
-    return { success: false, needsVaultEntry: true, valueType };
+  // first_name/last_name aren't stored separately - the vault only has
+  // one combined "name" field. Split it here rather than needing a
+  // second vault field, since most sites only need this split
+  // occasionally and asking the user to maintain two synchronized
+  // fields would be more friction than it's worth at this stage.
+  let value;
+  if (valueType === "first_name" || valueType === "last_name") {
+    const nameParts = (vault.name || "").trim().split(/\s+/).filter(Boolean);
+    if (nameParts.length === 0) {
+      value = null;
+    } else if (valueType === "first_name") {
+      value = nameParts[0];
+    } else {
+      // Last name = everything after the first token, so a name like
+      // "Abdul Rahman Siddiqui" gives last_name = "Rahman Siddiqui",
+      // not just the final word - more correct for multi-part surnames.
+      value = nameParts.length > 1 ? nameParts.slice(1).join(" ") : nameParts[0];
+    }
+  } else {
+    value = vault[valueType];
   }
 
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!value) {
+    return { success: false, needsVaultEntry: true, valueType: valueType === "first_name" || valueType === "last_name" ? "name" : valueType };
+  }
+
   const [result] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
+    target: { tabId: tabId ?? (await chrome.tabs.query({ active: true, currentWindow: true }))[0].id },
     func: executeFillByElementId,
     args: [elementId, value],
   });
@@ -457,9 +628,21 @@ runTaskBtn.addEventListener("click", async () => {
     for (let step = 1; step <= MAX_LOOP_STEPS; step++) {
       appendLog(`--- Step ${step}/${MAX_LOOP_STEPS} ---`);
 
+      // Resolve the active tab ONCE per step and reuse it for every
+      // call below. Previously each helper function (doDetect, doFill,
+      // doExecute, the error/success checks) independently called
+      // chrome.tabs.query on its own - if window/tab focus shifted at
+      // all during a step (e.g. DevTools open in a separate window),
+      // two calls within the SAME step could resolve to different
+      // tabs, causing a fill/click to target a tab where the detected
+      // element genuinely doesn't exist, even though detection itself
+      // was correct moments earlier.
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tabId = activeTab.id;
+
       appendLog("Capturing and detecting current page state...");
       await doCapture();
-      const { fields, clickableElements } = await doDetect();
+      const { fields, clickableElements } = await doDetect(tabId);
       await doRedact();
       appendLog(`Found ${fields.length} sensitive region(s), ${clickableElements.length} clickable element(s).`);
       console.log("[VisionGuard debug] clickableElements:", clickableElements);
@@ -500,7 +683,7 @@ runTaskBtn.addEventListener("click", async () => {
             `field-filling, since this is a clear, checkable page/task mismatch rather than ` +
             `a judgment call worth risking to the model.`
           );
-          const navResult = await doExecute(mismatchNav.id);
+          const navResult = await doExecute(mismatchNav.id, tabId);
           appendLog(navResult.success ? `Clicked: ${navResult.clickedElement}` : `Failed: ${navResult.reason}`);
           lastActionKey = `click:${mismatchNav.id}`;
 
@@ -516,10 +699,9 @@ runTaskBtn.addEventListener("click", async () => {
       // asking the VLM to visually read and self-report error text,
       // and also saves an unnecessary inference call once we already
       // know the page is showing a failure.
-      const [tabForErrorCheck] = await chrome.tabs.query({ active: true, currentWindow: true });
-      await chrome.scripting.executeScript({ target: { tabId: tabForErrorCheck.id }, files: ["error-detector.js"] });
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["error-detector.js"] });
       const [errorResult] = await chrome.scripting.executeScript({
-        target: { tabId: tabForErrorCheck.id },
+        target: { tabId },
         func: () => detectPageErrors(),
       });
 
@@ -538,7 +720,7 @@ runTaskBtn.addEventListener("click", async () => {
       // had already been submitted successfully, since nothing told it
       // that page state meant "done").
       const [successResult] = await chrome.scripting.executeScript({
-        target: { tabId: tabForErrorCheck.id },
+        target: { tabId },
         func: () => detectPageSuccess(),
       });
 
@@ -559,9 +741,15 @@ runTaskBtn.addEventListener("click", async () => {
       // plausibly on the right page should deterministic filling take
       // over, which is why this only activates from step 2 onward.
       const vaultForFill = await getVault();
+      const hasVaultValueFor = (fillableType) => {
+        if (fillableType === "first_name" || fillableType === "last_name") {
+          return Boolean((vaultForFill.name || "").trim());
+        }
+        return Boolean(vaultForFill[fillableType]);
+      };
       const emptyFillableWithVaultValue = step > 1
         ? clickableElements.find(
-            (el) => el.kind === "fillable" && !el.hasContent && vaultForFill[el.fillableType]
+            (el) => el.kind === "fillable" && !el.hasContent && hasVaultValueFor(el.fillableType)
           )
         : null;
 
@@ -571,7 +759,7 @@ runTaskBtn.addEventListener("click", async () => {
           `from vault - skipping model reasoning for this step, since this is a ` +
           `deterministic fill, not a judgment call.`
         );
-        const fillResult = await doFill(emptyFillableWithVaultValue.id, emptyFillableWithVaultValue.fillableType);
+        const fillResult = await doFill(emptyFillableWithVaultValue.id, emptyFillableWithVaultValue.fillableType, tabId);
         appendLog(fillResult.success ? `Filled: ${fillResult.filledElement}` : `Failed: ${fillResult.reason}`);
 
         if (step < MAX_LOOP_STEPS) {
@@ -614,9 +802,10 @@ runTaskBtn.addEventListener("click", async () => {
       // but this catches anything visually implied that has no
       // matching text keyword (e.g. a red border with no message).
       if (response.error_detected && response.error_message) {
-        appendLog(`\nERROR DETECTED (model-reported): ${response.error_message}`);
+        const categoryLabel = response.error_category ? ` [${response.error_category}]` : "";
+        appendLog(`\nERROR DETECTED (model-reported)${categoryLabel}: ${response.error_message}`);
         appendLog("Stopping - please correct the issue and re-run the task.");
-        alert(`VisionGuard detected a page error:\n\n"${response.error_message}"\n\nPlease correct the issue and try again.`);
+        alert(`VisionGuard detected a page error${categoryLabel}:\n\n"${response.error_message}"\n\nPlease correct the issue and try again.`);
         break;
       }
 
@@ -658,7 +847,7 @@ runTaskBtn.addEventListener("click", async () => {
         lastActionKey = actionKey;
 
         appendLog(`Executing click on element #${response.element_id}...`);
-        const execResult = await doExecute(response.element_id);
+        const execResult = await doExecute(response.element_id, tabId);
         appendLog(execResult.success ? `Clicked: ${execResult.clickedElement}` : `Failed: ${execResult.reason}`);
 
         if (!execResult.success) {
@@ -685,7 +874,7 @@ runTaskBtn.addEventListener("click", async () => {
         lastActionKey = actionKey;
 
         appendLog(`Filling element #${response.element_id} with vault value (${response.value_type})...`);
-        const fillResult = await doFill(response.element_id, response.value_type);
+        const fillResult = await doFill(response.element_id, response.value_type, tabId);
 
         if (fillResult.needsVaultEntry) {
           appendLog(`\nVault has no saved "${fillResult.valueType}" value.`);

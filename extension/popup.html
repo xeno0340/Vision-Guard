@@ -74,15 +74,17 @@
 
   <div id="redacted-container" style="margin-top: 10px; display: none;">
     <canvas id="redactedCanvas" style="width: 100%; border: 1px solid #444; border-radius: 6px;"></canvas>
+    <button id="viewFullSizeBtn" style="width: 100%; margin-top: 6px; padding: 6px; font-size: 12px; background: #444;">View full size (new tab)</button>
   </div>
 
   <div style="margin-top: 14px; padding: 10px; background: #252525; border-radius: 6px; border: 1px solid #444;">
     <div style="font-size: 12px; font-weight: bold; margin-bottom: 6px;">Vault (local only, never transmitted)</div>
     <input id="vaultName" placeholder="Name" style="width: 100%; margin-bottom: 4px; padding: 6px; background: #2a2a2a; color: #e8e8e8; border: 1px solid #444; border-radius: 4px; font-size: 12px; box-sizing: border-box;">
+    <input id="vaultUsername" placeholder="Username" style="width: 100%; margin-bottom: 4px; padding: 6px; background: #2a2a2a; color: #e8e8e8; border: 1px solid #444; border-radius: 4px; font-size: 12px; box-sizing: border-box;">
     <input id="vaultEmail" placeholder="Email" style="width: 100%; margin-bottom: 4px; padding: 6px; background: #2a2a2a; color: #e8e8e8; border: 1px solid #444; border-radius: 4px; font-size: 12px; box-sizing: border-box;">
     <input id="vaultPhone" placeholder="Phone" style="width: 100%; margin-bottom: 4px; padding: 6px; background: #2a2a2a; color: #e8e8e8; border: 1px solid #444; border-radius: 4px; font-size: 12px; box-sizing: border-box;">
     <input id="vaultAddress" placeholder="Address" style="width: 100%; margin-bottom: 4px; padding: 6px; background: #2a2a2a; color: #e8e8e8; border: 1px solid #444; border-radius: 4px; font-size: 12px; box-sizing: border-box;">
-    <input id="vaultPassword" type="password" placeholder="Password" style="width: 100%; margin-bottom: 6px; padding: 6px; background: #2a2a2a; color: #e8e8e8; border: 1px solid #444; border-radius: 4px; font-size: 12px; box-sizing: border-box;">
+    <input id="vaultPassword" type="password" placeholder="Password (prototype stage only)" style="width: 100%; margin-bottom: 6px; padding: 6px; background: #2a2a2a; color: #e8e8e8; border: 1px solid #444; border-radius: 4px; font-size: 12px; box-sizing: border-box;">
     <button id="saveVaultBtn" style="width: 100%; padding: 6px; font-size: 12px;">Save to Vault</button>
     <div id="vaultStatus" style="font-size: 11px; color: #999; margin-top: 4px;"></div>
   </div>

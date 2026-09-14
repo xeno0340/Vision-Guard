@@ -13,6 +13,55 @@
 // goes there, never a real value.
 
 function detectClickableElements() {
+
+  // Shadow DOM traversal helpers - document.querySelectorAll cannot see
+  // into an OPEN shadow root at all (it's a genuine encapsulation
+  // boundary, not an oversight), so any element rendered inside one -
+  // increasingly common with modern component frameworks - was
+  // completely invisible to detection before this. These walk into
+  // every open shadow root recursively. A CLOSED shadow root's
+  // .shadowRoot property returns null by design and remains genuinely
+  // inaccessible from outside - that specific case is a real, permanent
+  // limitation, not something any traversal approach can work around.
+  function queryAllDeep(selector, root) {
+    root = root || document;
+    const results = Array.from(root.querySelectorAll(selector));
+    root.querySelectorAll("*").forEach((el) => {
+      if (el.shadowRoot) {
+        results.push(...queryAllDeep(selector, el.shadowRoot));
+      }
+    });
+    return results;
+  }
+
+  function queryOneDeep(selector, root) {
+    root = root || document;
+    const direct = root.querySelector(selector);
+    if (direct) return direct;
+    const hosts = root.querySelectorAll("*");
+    for (const el of hosts) {
+      if (el.shadowRoot) {
+        const found = queryOneDeep(selector, el.shadowRoot);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  function getElementByIdDeep(id, root) {
+    root = root || document;
+    const direct = root.getElementById(id);
+    if (direct) return direct;
+    const hosts = root.querySelectorAll("*");
+    for (const el of hosts) {
+      if (el.shadowRoot) {
+        const found = getElementByIdDeep(id, el.shadowRoot);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
   // Clear tags from any PREVIOUS detection pass first. Without this, an
   // element tagged in an earlier step (on a page that hasn't reloaded -
   // e.g. inline form validation, not a navigation) keeps its old tag,
@@ -23,7 +72,7 @@ function detectClickableElements() {
   // start from a genuinely clean slate, not accumulate state from
   // previous ones - same principle as always re-perceiving before
   // acting, applied to tagging instead of just screenshots.
-  document.querySelectorAll("[data-visionguard-id]").forEach((el) => {
+  queryAllDeep("[data-visionguard-id]").forEach((el) => {
     el.removeAttribute("data-visionguard-id");
   });
 
@@ -68,7 +117,7 @@ function detectClickableElements() {
     if (labelledBy) {
       const text = labelledBy
         .split(/\s+/)
-        .map((elId) => document.getElementById(elId))
+        .map((elId) => getElementByIdDeep(elId))
         .filter(Boolean)
         .map((labelEl) => labelEl.textContent.trim())
         .join(" ")
@@ -79,7 +128,7 @@ function detectClickableElements() {
     if (ariaLabel && ariaLabel.trim()) return ariaLabel.trim();
 
     if (el.id) {
-      const forLabel = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      const forLabel = queryOneDeep(`label[for="${CSS.escape(el.id)}"]`);
       if (forLabel) return forLabel.textContent.trim();
     }
     const wrapping = el.closest("label");
@@ -116,17 +165,49 @@ function detectClickableElements() {
     if (/email/.test(combined)) return "email";
     if (/phone|mobile|tel(ephone)?/.test(combined)) return "phone";
     if (/\baddress\b|\badress\b|street|city/.test(combined)) return "address";
-    if (/^name$|full.?name|your.?name|first.?name|given.?name|nick.?name|user.?name|display.?name/.test(combined)) return "name";
+    // Checked BEFORE the generic "name" pattern below - "username"
+    // contains the substring "name", so without this ordering a
+    // username field would incorrectly get the vault's full NAME value
+    // instead of an actual username. Real gap: previously "username"
+    // was lumped into the same "name" bucket entirely.
+    if (autocomplete === "username" || /user.?name|\blogin.?id\b|\buid\b/.test(combined)) return "username";
+    if (/^name$|full.?name|your.?name|nick.?name|display.?name/.test(combined)) return "name";
+    // Split first/last-name fields get their own distinct types rather
+    // than being folded into "name" - the vault stores one combined
+    // name, so filling a "First Name" box needs just the first token,
+    // not the whole string. Checked with word-boundary patterns so
+    // "first" alone doesn't over-match unrelated fields.
+    if (/first.?name|given.?name|\bfname\b/.test(combined)) return "first_name";
+    if (/last.?name|sur.?name|family.?name|\blname\b/.test(combined)) return "last_name";
     return null;
+  }
+
+  // Anti-bot honeypot fields - see the matching function/comment in
+  // dom-detector.js. Applied here too since this file is what actually
+  // drives fill EXECUTION - the more important place to never touch one.
+  function isLikelyHoneypot(el, rect) {
+    const style = window.getComputedStyle(el);
+    if (style.opacity === "0" || style.visibility === "hidden") return true;
+    if (parseInt(style.fontSize, 10) === 0) return true;
+    if (rect.left < -500 || rect.top < -500) return true;
+    if (el.tabIndex === -1 && el.getAttribute("aria-hidden") === "true") return true;
+
+    const name = (el.getAttribute("name") || "").toLowerCase();
+    const id = (el.getAttribute("id") || "").toLowerCase();
+    if (/honeypot|honey.?pot|\bhp_|bot.?field|bot.?trap|\btrap\b|do.?not.?fill|leave.?blank/.test(`${name} ${id}`)) {
+      return true;
+    }
+    return false;
   }
 
   const results = [];
   let idCounter = 1;
 
-  document.querySelectorAll(CLICKABLE_SELECTOR).forEach((el) => {
+  queryAllDeep(CLICKABLE_SELECTOR).forEach((el) => {
     const rect = el.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return;
     if (rect.bottom < 0 || rect.top > window.innerHeight) return;
+    if (isLikelyHoneypot(el, rect)) return;
 
     const label = (
       el.textContent?.trim() || el.getAttribute("aria-label") ||
@@ -144,18 +225,25 @@ function detectClickableElements() {
     });
   });
 
-  document.querySelectorAll(FILLABLE_SELECTOR).forEach((el) => {
+  queryAllDeep(FILLABLE_SELECTOR).forEach((el) => {
     const rect = el.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return;
     if (rect.bottom < 0 || rect.top > window.innerHeight) return;
+    if (isLikelyHoneypot(el, rect)) return;
     if (el.hasAttribute("data-visionguard-id")) return; // already tagged as clickable
 
-    // Password fields use the plain "password" type directly - no
-    // ambiguity to resolve there. Everything else gets a real label
-    // resolved first, THEN classified - and crucially, an unrecognized
-    // classification no longer means the field is discarded.
+    // Password fields: checked via name/id/label FIRST, regardless of
+    // the CURRENT type attribute - fixes a real miscategorization where
+    // a password field whose type is toggled to "text" by a show-
+    // password control was classified as a generic name/pii field
+    // instead, since the old check only read the live type attribute.
     const resolvedLabel = resolveLabelText(el);
-    const fillableType = el.type === "password" ? "password" : classifyFillableType(el, resolvedLabel);
+    const looksLikePassword =
+      el.type === "password" ||
+      /pass(word)?/i.test(el.getAttribute("name") || "") ||
+      /pass(word)?/i.test(el.getAttribute("id") || "") ||
+      /pass(word)?/i.test(resolvedLabel);
+    const fillableType = looksLikePassword ? "password" : classifyFillableType(el, resolvedLabel);
 
     // Skip only if we have neither a confident classification NOR any
     // usable label text at all - a field with no label and no
