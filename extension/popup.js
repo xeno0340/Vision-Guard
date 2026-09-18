@@ -4,6 +4,38 @@
 // send/execute) into reusable async functions, and added an automatic
 // multi-step task loop on top of them.
 //
+// v6: added checkAndDismissPopup() - a deterministic popup/overlay
+// dismissal step run every iteration, before the nav-mismatch check,
+// error/success detection, or auto-fill. It uses allFrames: true to
+// reach cross-origin iframes (where ads commonly live), which every
+// other detector in this file deliberately does NOT do, since doing so
+// for the sensitive-field/clickable-element detectors would require
+// solving cross-frame coordinate translation for the Set-of-Mark
+// overlay - a separate, bigger piece of work. See popup-detector.js
+// for the detection/dismissal logic itself.
+//
+// v7: the repeat-action safeguard's key now includes the element's
+// label and the tab's current URL, not just its numeric id. Element
+// ids are reassigned fresh (starting at 1) on EVERY detection pass, so
+// "element #11" on one step and "element #11" on a later step are
+// almost never the same physical element - real false-stop found where
+// a successful login (id 11 = the real login button) was immediately
+// followed by a fresh page where a completely different element
+// happened to also land on id 11, and the safeguard wrongly treated it
+// as a repeat and stopped a task that had actually already succeeded.
+//
+// v8: replaced the fixed POST_ACTION_WAIT_MS delay after CLICK actions
+// with waitForTabSettled(), which waits for tab activity to go quiet
+// for a settle window rather than guessing a fixed duration or
+// resolving on the first "complete" signal. Real gap found: DeluGeRPG's
+// login flow chains through an intermediate /login/validate hop before
+// finally landing on the account home page - a page that itself
+// reaches "complete" almost immediately, so a wait that resolved on
+// the first such signal landed the loop on that transitional page,
+// moments before the browser navigated away from it again. Fill
+// actions keep the simpler fixed wait, since they don't trigger
+// navigation.
+//
 // Why the loop matters: a single capture->decide->act cycle assumes the
 // page state at decision time still matches the page state at execution
 // time. That assumption breaks the moment an action causes ANY page
@@ -82,7 +114,10 @@ saveVaultBtn.addEventListener("click", async () => {
 
 const SERVER_URL = "http://localhost:8000/agent/step";
 const MAX_LOOP_STEPS = 6;
-const POST_ACTION_WAIT_MS = 1500; // fixed settle time after an action, before re-perceiving
+const POST_ACTION_WAIT_MS = 1500; // fixed settle time after a FILL action (no navigation expected)
+const NAV_WAIT_TIMEOUT_MS = 8000; // hard ceiling for a CLICK-triggered navigation CHAIN to finish
+const NAV_SETTLE_BUFFER_MS = 600; // window of no tab activity required before considering it settled
+const MIN_POST_CLICK_WAIT_MS = 2000; // floor BEFORE settle-checking even starts, for actions with an invisible pre-navigation delay (e.g. a server round-trip validating a login POST before any redirect begins)
 
 // Shared state - kept for the manual step buttons, which are still
 // useful for debugging one stage at a time. The automatic loop below
@@ -219,12 +254,6 @@ function detectFacesInDataUrl(dataUrl) {
 }
 
 function executeClickByElementId(elementId) {
-  // Self-contained deep query - this function is injected standalone
-  // via func:, not alongside the detector files, so it can't reference
-  // their queryOneDeep/queryAllDeep helpers and needs its own copy.
-  // Real bug found: detection could already see elements inside an
-  // open shadow root (queryAllDeep), but execution still used a plain
-  // document.querySelector and could never find what detection found.
   function findDeep(selector, root) {
     root = root || document;
     const direct = root.querySelector(selector);
@@ -256,10 +285,6 @@ function executeClickByElementId(elementId) {
   };
 }
 
-// Fills a text field with a value, dispatching proper input/change
-// events so frameworks (React, Vue, etc.) that listen for those events
-// register the change - just setting .value directly is invisible to
-// most modern form-handling code.
 function executeFillByElementId(elementId, value) {
   function findDeep(selector, root) {
     root = root || document;
@@ -289,10 +314,6 @@ function executeFillByElementId(elementId, value) {
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
   } else {
-    // contenteditable / role=textbox (Google Forms and similar custom-
-    // rendered fields) - no .value property at all, text content IS
-    // the value. Focus first since some frameworks only register the
-    // change if the element was genuinely focused when it changed.
     el.focus();
     el.textContent = value;
     el.dispatchEvent(new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" }));
@@ -468,19 +489,9 @@ async function doExecute(elementId, tabId) {
   return result.result;
 }
 
-// Fills a field from the local vault. Returns a special
-// { success: false, needsVaultEntry: true } shape if the vault has no
-// value for the requested type - the caller decides how to handle that
-// (currently: stop and prompt the human, never guess or leave blank
-// silently).
 async function doFill(elementId, valueType, tabId) {
   const vault = await getVault();
 
-  // first_name/last_name aren't stored separately - the vault only has
-  // one combined "name" field. Split it here rather than needing a
-  // second vault field, since most sites only need this split
-  // occasionally and asking the user to maintain two synchronized
-  // fields would be more friction than it's worth at this stage.
   let value;
   if (valueType === "first_name" || valueType === "last_name") {
     const nameParts = (vault.name || "").trim().split(/\s+/).filter(Boolean);
@@ -489,9 +500,6 @@ async function doFill(elementId, valueType, tabId) {
     } else if (valueType === "first_name") {
       value = nameParts[0];
     } else {
-      // Last name = everything after the first token, so a name like
-      // "Abdul Rahman Siddiqui" gives last_name = "Rahman Siddiqui",
-      // not just the final word - more correct for multi-part surnames.
       value = nameParts.length > 1 ? nameParts.slice(1).join(" ") : nameParts[0];
     }
   } else {
@@ -508,6 +516,112 @@ async function doFill(elementId, valueType, tabId) {
     args: [elementId, value],
   });
   return result.result;
+}
+
+// Checks for a blocking popup/overlay/ad across EVERY frame in the tab
+// (including cross-origin iframes, via allFrames: true) and, if found,
+// clicks its close control directly - no model call involved, same
+// "catch it in code" pattern as the error/success detectors below.
+async function checkAndDismissPopup(tabId) {
+  await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    files: ["popup-detector.js"],
+  });
+
+  const detectionResults = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    func: () => detectAndTagPopupClose(),
+  });
+
+  const hit = detectionResults.find((r) => r.result && r.result.found);
+  if (!hit) return { found: false };
+
+  const [closeResult] = await chrome.scripting.executeScript({
+    target: { tabId, frameIds: [hit.frameId] },
+    func: () => clickTaggedPopupClose(),
+  });
+
+  return {
+    found: true,
+    frameContext: hit.result.frameContext,
+    label: hit.result.label,
+    closeSuccess: closeResult?.result?.success ?? false,
+    closeReason: closeResult?.result?.reason,
+  };
+}
+
+// Waits for the tab to fully settle after a click that might trigger
+// navigation - INCLUDING a CHAIN of redirects, not just the first hop.
+// Real gap found: DeluGeRPG's login flow goes /login -> an intermediate
+// /login/validate page (which itself reaches "complete" status almost
+// immediately, being lightweight) -> a final client-triggered redirect
+// to /home/... . A wait that resolved on the FIRST "complete" signal
+// caught the loop on /login/validate - a page with real clickable
+// elements (so nothing looked obviously broken) but one the browser was
+// about to navigate away from again a moment later, invalidating
+// whatever got tagged there by the time execution actually ran.
+//
+// Approach: treat the tab as "settled" only once NAV_SETTLE_BUFFER_MS
+// passes with no further status or URL change at all - any activity
+// resets the timer, so however many hops a redirect chain has, this
+// naturally rides out all of them before resolving. A hard ceiling
+// (maxTotalWaitMs) guarantees it can never hang forever even against a
+// tab that keeps changing indefinitely (e.g. some unrelated background
+// poll).
+function waitForTabSettled(tabId, maxTotalWaitMs) {
+  return new Promise((resolve) => {
+    let finished = false;
+    let settleTimer = null;
+
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      if (settleTimer) clearTimeout(settleTimer);
+      clearTimeout(hardTimeout);
+      resolve();
+    };
+
+    const armSettleTimer = () => {
+      if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = setTimeout(finish, NAV_SETTLE_BUFFER_MS);
+    };
+
+    const listener = (updatedTabId, changeInfo) => {
+      if (updatedTabId !== tabId) return;
+      // Only status/url changes count as "still navigating" - ignore
+      // other changeInfo fields (title, favIconUrl, etc.) that fire
+      // routinely without indicating an actual redirect in progress.
+      if (changeInfo.status || changeInfo.url) {
+        armSettleTimer();
+      }
+    };
+
+    chrome.tabs.onUpdated.addListener(listener);
+    // Start the settle timer immediately too, so a click that DIDN'T
+    // trigger any navigation at all still resolves promptly after one
+    // buffer window, rather than waiting for an onUpdated event that
+    // will never come.
+    armSettleTimer();
+
+    const hardTimeout = setTimeout(finish, maxTotalWaitMs);
+  });
+}
+
+// Wraps waitForTabSettled() with an unconditional floor BEFORE the
+// settle-check even begins. Real gap found: a login click's resulting
+// server round-trip (validating credentials) can leave the tab
+// completely silent - no status change, no URL change - for a real
+// stretch BEFORE any visible navigation starts. waitForTabSettled on
+// its own reads that initial silence as "nothing more is coming" and
+// resolves immediately, capturing the STILL-on-the-old-page state; the
+// real redirect then fires a moment later, invisible to a loop that
+// already moved on and (wrongly) concluded the action had no effect.
+// This floor gives that invisible pre-navigation gap room to actually
+// begin before the silence-based settle logic is ever consulted.
+async function waitAfterClick(tabId) {
+  await new Promise((r) => setTimeout(r, MIN_POST_CLICK_WAIT_MS));
+  await waitForTabSettled(tabId, NAV_WAIT_TIMEOUT_MS);
 }
 
 // ============================================================
@@ -618,7 +732,22 @@ runTaskBtn.addEventListener("click", async () => {
 
   runTaskBtn.disabled = true;
   let log = "";
-  let lastActionKey = null; // tracks (action, element_id) to detect the model repeating itself
+  let lastActionKey = null; // tracks (action, element_id, label, url) to detect the model repeating itself
+
+  // Structural completion state for login/signup tasks - scoped to
+  // THIS one task run only, reset to nothing every time Run Task is
+  // clicked, never persisted anywhere. Tracks the plain FACT of
+  // "a password field was visible earlier" and "what URL did this
+  // task start at" - never any field VALUE - so a login/signup can be
+  // recognized as complete once its password field genuinely
+  // disappears and the URL has moved on, without depending on the
+  // model correctly interpreting any success message or badge, and
+  // without needing real cross-step memory of the kind ruled out
+  // earlier for privacy reasons.
+  const taskIsAuthTask = /sign\s?up|register|create\s+an?\s+account|create\s+account|log\s?in|sign\s?in/i.test(taskInstruction);
+  let taskStartUrl = null;
+  let sawPasswordField = false;
+
   const appendLog = (line) => {
     log += line + "\n";
     serverResponseEl.textContent = log;
@@ -628,15 +757,6 @@ runTaskBtn.addEventListener("click", async () => {
     for (let step = 1; step <= MAX_LOOP_STEPS; step++) {
       appendLog(`--- Step ${step}/${MAX_LOOP_STEPS} ---`);
 
-      // Resolve the active tab ONCE per step and reuse it for every
-      // call below. Previously each helper function (doDetect, doFill,
-      // doExecute, the error/success checks) independently called
-      // chrome.tabs.query on its own - if window/tab focus shifted at
-      // all during a step (e.g. DevTools open in a separate window),
-      // two calls within the SAME step could resolve to different
-      // tabs, causing a fill/click to target a tab where the detected
-      // element genuinely doesn't exist, even though detection itself
-      // was correct moments earlier.
       const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
       const tabId = activeTab.id;
 
@@ -647,16 +767,30 @@ runTaskBtn.addEventListener("click", async () => {
       appendLog(`Found ${fields.length} sensitive region(s), ${clickableElements.length} clickable element(s).`);
       console.log("[VisionGuard debug] clickableElements:", clickableElements);
 
-      // Deterministic navigation check - STEP 1 ONLY. The model was
-      // explicitly instructed (in the server prompt) to recognize when
-      // it's on the wrong page for the task and navigate first, but in
-      // practice it repeatedly ignored that instruction and filled
-      // fields on a login page even when the task said "sign up". That's
-      // real evidence this specific judgment call isn't reliable for a
-      // 3B model, not a prompt-wording problem worth iterating on
-      // further tonight. Same fix pattern as auto-fill: take the
-      // decision away from the model for the one narrow, checkable case
-      // we can detect confidently in code.
+      if (step === 1) {
+        taskStartUrl = activeTab.url;
+      }
+      const hasPasswordFieldNow = fields.some((f) => f.category === "password");
+      if (hasPasswordFieldNow) {
+        sawPasswordField = true;
+      }
+
+      appendLog("Checking for blocking popups/overlays (including ad iframes)...");
+      const popupCheck = await checkAndDismissPopup(tabId);
+      if (popupCheck.found) {
+        appendLog(
+          `Popup/overlay detected in ${popupCheck.frameContext === "iframe" ? "a cross-origin iframe (likely an ad)" : "the page"} ` +
+          `- close control: "${popupCheck.label}". ` +
+          (popupCheck.closeSuccess ? "Dismissed." : `Failed to dismiss: ${popupCheck.closeReason}`)
+        );
+        if (popupCheck.closeSuccess) {
+          if (step < MAX_LOOP_STEPS) {
+            await new Promise((r) => setTimeout(r, 800));
+          }
+          continue;
+        }
+      }
+
       if (step === 1) {
         const taskWantsSignup = /sign\s?up|register|create\s+an?\s+account|create\s+account/i.test(taskInstruction);
         const taskWantsLogin = /log\s?in|sign\s?in/i.test(taskInstruction) && !taskWantsSignup;
@@ -664,10 +798,6 @@ runTaskBtn.addEventListener("click", async () => {
         const signupNavElement = clickableElements.find(
           (el) => el.kind === "clickable" &&
             /sign\s?up|register|create\s+an?\s+account|join\s+now/i.test(el.label) &&
-            // "Agree & Sign Up!" style labels are the signup FORM's own
-            // submit button, not a link to navigate TO the signup page -
-            // real bug found when this fired on an already-loaded signup
-            // page and clicked Submit before any field was filled.
             !/agree/i.test(el.label)
         );
         const loginNavElement = clickableElements.find(
@@ -685,20 +815,16 @@ runTaskBtn.addEventListener("click", async () => {
           );
           const navResult = await doExecute(mismatchNav.id, tabId);
           appendLog(navResult.success ? `Clicked: ${navResult.clickedElement}` : `Failed: ${navResult.reason}`);
-          lastActionKey = `click:${mismatchNav.id}`;
+          lastActionKey = `click:${mismatchNav.id}:${mismatchNav.label}:${activeTab.url}`;
 
           if (step < MAX_LOOP_STEPS) {
-            await new Promise((r) => setTimeout(r, POST_ACTION_WAIT_MS));
+            appendLog("Waiting for page navigation to complete before re-perceiving...\n");
+            await waitAfterClick(tabId);
           }
           continue;
         }
       }
 
-      // Check for a page-level error DETERMINISTICALLY via DOM text,
-      // before even calling the model. This is more reliable than
-      // asking the VLM to visually read and self-report error text,
-      // and also saves an unnecessary inference call once we already
-      // know the page is showing a failure.
       await chrome.scripting.executeScript({ target: { tabId }, files: ["error-detector.js"] });
       const [errorResult] = await chrome.scripting.executeScript({
         target: { tabId },
@@ -712,13 +838,27 @@ runTaskBtn.addEventListener("click", async () => {
         break;
       }
 
-      // Same deterministic pattern as the error check above, for the
-      // opposite signal: a genuine success/confirmation message. Without
-      // this, the model has no way to know a task already succeeded and
-      // will keep interacting with whatever's left on the page (real
-      // observed case: clicking "Submit another response" after a form
-      // had already been submitted successfully, since nothing told it
-      // that page state meant "done").
+      // Structural success check for login/signup tasks specifically:
+      // a password field was genuinely present earlier THIS task, is
+      // genuinely absent now (gone from detection entirely, not just
+      // redacted-and-hidden), and the URL has changed since the task
+      // began. Unlike the keyword-based check below, this can't be
+      // fooled by an unfamiliar "success"-shaped badge (a Cloudflare
+      // widget, say) - it doesn't depend on the model, or on this
+      // check itself, correctly interpreting any UI content at all.
+      if (taskIsAuthTask && sawPasswordField && !hasPasswordFieldNow && activeTab.url !== taskStartUrl) {
+        appendLog(
+          `\nStructural success check: a password field was present ` +
+          `earlier in this task and is no longer on the page, and the ` +
+          `URL has changed since the task started (${taskStartUrl} -> ` +
+          `${activeTab.url}). Treating this as a completed login/signup, ` +
+          `independent of any success-message text or the model's own ` +
+          `judgment.`
+        );
+        appendLog("Task complete - stopping here rather than continuing to interact with a completed page.");
+        break;
+      }
+
       const [successResult] = await chrome.scripting.executeScript({
         target: { tabId },
         func: () => detectPageSuccess(),
@@ -730,16 +870,6 @@ runTaskBtn.addEventListener("click", async () => {
         break;
       }
 
-      // Deterministic auto-fill pass: fill any empty fillable field the
-      // vault has a value for, BEFORE asking the model what to do -
-      // EXCEPT on step 1. The model must always get to make the first
-      // move on a fresh task, because "is this even the right page for
-      // this task?" is a judgment call auto-fill can't make - it just
-      // fills whatever's in front of it with no sense of context. If
-      // the user says "sign up" while sitting on a login page, step 1
-      // needs to recognize that and navigate first; only once we're
-      // plausibly on the right page should deterministic filling take
-      // over, which is why this only activates from step 2 onward.
       const vaultForFill = await getVault();
       const hasVaultValueFor = (fillableType) => {
         if (fillableType === "first_name" || fillableType === "last_name") {
@@ -763,25 +893,11 @@ runTaskBtn.addEventListener("click", async () => {
         appendLog(fillResult.success ? `Filled: ${fillResult.filledElement}` : `Failed: ${fillResult.reason}`);
 
         if (step < MAX_LOOP_STEPS) {
-          // Chrome hard-caps captureVisibleTab() calls per second
-          // (MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND) - 400ms was too
-          // fast and tripped that limit on a real run. A fill doesn't
-          // need the full 1500ms navigation-settle wait, but it does
-          // need enough headroom to stay under Chrome's own rate limit.
           await new Promise((r) => setTimeout(r, 1200));
         }
-        continue; // next loop iteration re-detects and checks for more fields to fill
+        continue;
       }
 
-      // If the task explicitly says not to submit/click further, and
-      // there's nothing left for the deterministic auto-fill pass to
-      // fill, the task is genuinely done - full stop, no model call.
-      // Without this, the model has no concept of "the task was only
-      // ever autofill" and will wander into clicking something else
-      // once filling is finished (real observed case: it correctly
-      // avoided the Submit button per instruction, then clicked "Sign
-      // in to Google" instead, since nothing told it there was nothing
-      // left to legitimately do).
       const taskSaysNoSubmit = /\bdon'?t\s+submit\b|\bdo\s+not\s+submit\b|without\s+submitting/i.test(taskInstruction);
       if (taskSaysNoSubmit && step > 1) {
         appendLog(
@@ -797,10 +913,6 @@ runTaskBtn.addEventListener("click", async () => {
       appendLog(`action: ${response.action}, element_id: ${response.element_id}`);
       appendLog(`note: ${response.note}`);
 
-      // Keep the model's own error self-report too, as a secondary
-      // check - the DOM scan above covers the common case reliably,
-      // but this catches anything visually implied that has no
-      // matching text keyword (e.g. a red border with no message).
       if (response.error_detected && response.error_message) {
         const categoryLabel = response.error_category ? ` [${response.error_category}]` : "";
         appendLog(`\nERROR DETECTED (model-reported)${categoryLabel}: ${response.error_message}`);
@@ -824,27 +936,24 @@ runTaskBtn.addEventListener("click", async () => {
         break;
       }
 
+      let actionMightNavigate = false;
+
       if (response.action === "click" && response.element_id != null) {
-        // Repeat-action safeguard: the model has no memory of prior steps
-        // in this loop, so it can't tell "I already tried this and it
-        // didn't work" - it just sees a similar-looking page and repeats
-        // itself. Detecting this in code (not asking the model to) stops
-        // a genuinely stuck loop from burning through every remaining
-        // step on the same failing action.
-        const actionKey = `${response.action}:${response.element_id}`;
+        const targetLabel = (clickableElements.find((el) => el.id === response.element_id) || {}).label || "";
+        const actionKey = `${response.action}:${response.element_id}:${targetLabel}:${activeTab.url}`;
         if (actionKey === lastActionKey) {
           appendLog(
-            `\nStopping - model chose the same action twice in a row ` +
-            `(element #${response.element_id}). This usually means the ` +
-            `action isn't producing the expected page change (e.g. a ` +
-            `login attempt that fails and returns to the same form). ` +
-            `The model has no memory of prior steps to recognize this on ` +
-            `its own, so the loop stops here rather than repeating ` +
-            `uselessly.`
+            `\nStopping - model chose the same action twice in a row on the ` +
+            `same page (element #${response.element_id}, "${targetLabel}"). ` +
+            `This usually means the action isn't producing the expected page ` +
+            `change (e.g. a login attempt that fails and returns to the same ` +
+            `form). The model has no memory of prior steps to recognize this ` +
+            `on its own, so the loop stops here rather than repeating uselessly.`
           );
           break;
         }
         lastActionKey = actionKey;
+        actionMightNavigate = true;
 
         appendLog(`Executing click on element #${response.element_id}...`);
         const execResult = await doExecute(response.element_id, tabId);
@@ -855,19 +964,16 @@ runTaskBtn.addEventListener("click", async () => {
           break;
         }
       } else if (response.action === "type" && response.element_id != null && response.value_type) {
-        // Same repeat-safeguard as click actions - this was previously
-        // ONLY checked for clicks, which is exactly why the model could
-        // repeat an identical "type" request 4 times in a row (steps
-        // 3-6 of the DeluGeRPG run) without the loop ever catching it.
-        const actionKey = `${response.action}:${response.element_id}:${response.value_type}`;
+        const targetLabel = (clickableElements.find((el) => el.id === response.element_id) || {}).label || "";
+        const actionKey = `${response.action}:${response.element_id}:${response.value_type}:${targetLabel}:${activeTab.url}`;
         if (actionKey === lastActionKey) {
           appendLog(
-            `\nStopping - model chose the same type action twice in a row ` +
-            `(element #${response.element_id}, ${response.value_type}). This ` +
-            `usually means the field already has a value the model isn't ` +
-            `recognizing as filled (for example, a redacted field showing a ` +
-            `placeholder in the image the model sees, rather than the real ` +
-            `content). The loop stops here rather than repeating uselessly.`
+            `\nStopping - model chose the same type action twice in a row on the ` +
+            `same page (element #${response.element_id}, ${response.value_type}, ` +
+            `"${targetLabel}"). This usually means the field already has a value ` +
+            `the model isn't recognizing as filled (for example, a redacted field ` +
+            `showing a placeholder in the image the model sees, rather than the ` +
+            `real content). The loop stops here rather than repeating uselessly.`
           );
           break;
         }
@@ -894,8 +1000,13 @@ runTaskBtn.addEventListener("click", async () => {
       }
 
       if (step < MAX_LOOP_STEPS) {
-        appendLog(`Waiting ${POST_ACTION_WAIT_MS}ms for page to settle before re-perceiving...\n`);
-        await new Promise((r) => setTimeout(r, POST_ACTION_WAIT_MS));
+        if (actionMightNavigate) {
+          appendLog("Waiting for page navigation to complete before re-perceiving...\n");
+          await waitAfterClick(tabId);
+        } else {
+          appendLog(`Waiting ${POST_ACTION_WAIT_MS}ms for page to settle before re-perceiving...\n`);
+          await new Promise((r) => setTimeout(r, POST_ACTION_WAIT_MS));
+        }
       }
     }
   } catch (err) {

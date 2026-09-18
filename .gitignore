@@ -16,7 +16,7 @@ server/received_images/
 testing/results.json
 testing/annotation.csv
 testing/debug-screenshots/
-
+debug/screenshots/
 # OS / editor
 .DS_Store
 Thumbs.db

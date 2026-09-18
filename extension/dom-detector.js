@@ -218,9 +218,34 @@ function detectSensitiveFields() {
     return false;
   }
 
+  // Real bug found: a submit BUTTON ("Login", type="submit") was being
+  // classified as a password field and redacted, completely covering
+  // the real login button with a fake gray password box. Root cause:
+  // getAssociatedLabelText()'s sibling-walk fallback has no distance
+  // limit, and real <input> elements have empty textContent (inputs
+  // aren't text nodes), so the walk skipped past the actual password
+  // field and a Cloudflare widget and kept going until it reached the
+  // "PASSWORD" label meant for a DIFFERENT field entirely - the button
+  // inherited that label purely because nothing closer qualified.
+  // Compounded by hasContent() treating a button's own value="Login"
+  // (its label, not user-entered content) as "has content."
+  //
+  // The label-association fallback's lack of a distance limit is a
+  // real, separate latent fragility worth revisiting - some other
+  // non-button field could still inherit a distant, unrelated label
+  // the same way. The fix below closes the specific failure that
+  // actually happened: button-type inputs are never a place a user
+  // enters sensitive data, regardless of what label text they end up
+  // associated with, so they're excluded from candidacy entirely,
+  // before classification ever runs.
+  const NON_DATA_ENTRY_TYPES = ["submit", "button", "reset", "image"];
+
   const candidates = queryAllDeep("input, textarea");
 
   candidates.forEach((el) => {
+    const elType = (el.getAttribute("type") || "").toLowerCase();
+    if (NON_DATA_ENTRY_TYPES.includes(elType)) return;
+
     const classification = classifyField(el);
     if (!classification) return;
     if (!hasContent(el)) return;

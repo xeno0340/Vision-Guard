@@ -27,11 +27,6 @@ function detectPageErrors() {
     "wrong password", "wrong username", "please enter",
     "try again", "not found", "unauthorized", "denied",
     "required field", "this field is required",
-    // Positive-framing validation messages ("only X is allowed" rather
-    // than "X is invalid") were missing entirely - real gap found when
-    // a nickname-format rule ("Only alphanumeric characters ... are
-    // allowed") went completely undetected because it never used any
-    // of the negative-framing words above.
     "are allowed", "is allowed", "not allowed", "must contain",
     "must be", "cannot contain", "already taken", "already exists",
     "already in use", "already registered",
@@ -42,9 +37,6 @@ function detectPageErrors() {
   const candidates = queryAllDeep("div, p, span, li, small, strong, b");
 
   for (const el of candidates) {
-    // Only look at leaf-ish, visible, currently-rendered text nodes -
-    // skip elements that just contain other elements (avoids matching
-    // giant wrapper divs and returning unhelpfully long text blobs).
     if (el.children.length > 2) continue;
 
     const rect = el.getBoundingClientRect();
@@ -57,9 +49,6 @@ function detectPageErrors() {
     const hasKeyword = ERROR_KEYWORDS.some((kw) => lowerText.includes(kw));
     const hasErrorStyling = ERROR_CLASS_HINTS.test(el.className || "");
 
-    // Require EITHER a strong keyword match OR (keyword + error-like
-    // styling) to avoid false positives on unrelated text that happens
-    // to contain a common word like "required" in a non-error context.
     if (hasKeyword) {
       return {
         found: true,
@@ -74,16 +63,13 @@ function detectPageErrors() {
 
 // Mirrors detectPageErrors() above, for the opposite case: recognizing
 // that a task has genuinely SUCCEEDED, not just that no error occurred.
-// Without this, the model has no concept of what "done" looks like for
-// a given task - it sees a confirmation page with a still-clickable
-// "Submit another response" link and, having no signal that success
-// already happened, just clicks the next obvious thing (real observed
-// behavior: it did exactly this after a Google Form was submitted
-// successfully). Checked deterministically, same reasoning as errors -
-// reliably reading a short confirmation phrase from the page is more
-// dependable via DOM text search than via the model's own visual
-// reading, especially combined with everything else it has to get
-// right in one response.
+// Includes login-specific success phrasing ("welcome back" etc). Note:
+// keyword coverage was NOT the root cause of the DeluGeRPG login case -
+// that was a timing issue (a multi-hop redirect landing this check on
+// an intermediate page before the real content rendered), fixed in
+// popup.js via waitForTabLoadComplete(). This keyword list is still a
+// real, worthwhile improvement on its own merits, just not sufficient
+// by itself.
 function detectPageSuccess() {
   const SUCCESS_KEYWORDS = [
     "response has been recorded", "your response has been recorded",
@@ -91,6 +77,8 @@ function detectPageSuccess() {
     "thanks for submitting", "your submission has been received",
     "registration successful", "account created", "welcome aboard",
     "successfully registered", "successfully signed up",
+    "welcome back", "you are now logged in", "you're now logged in",
+    "logged in successfully", "successfully logged in", "login successful",
   ];
 
   const candidates = queryAllDeep("div, p, span, li, h1, h2, h3");
