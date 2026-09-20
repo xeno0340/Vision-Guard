@@ -75,6 +75,26 @@ const taskInput = document.getElementById("taskInput");
 const sendBtn = document.getElementById("sendBtn");
 const serverResponseEl = document.getElementById("serverResponse");
 const runTaskBtn = document.getElementById("runTaskBtn");
+const resumeBanner = document.getElementById("resumeBanner");
+const resumeBannerText = document.getElementById("resumeBannerText");
+const resumeTaskBtn = document.getElementById("resumeTaskBtn");
+
+// Checks whether the CURRENT task text has a stored stop reason from a
+// previous run, and shows/hides the small "Resume this task" banner
+// accordingly. Only ever an exact (light-normalized) match - never a
+// fuzzy guess - so the banner is never shown for a task the person
+// didn't actually mean.
+async function refreshResumeBanner() {
+  const reason = await getTaskStopReason(taskInput.value);
+  if (reason) {
+    resumeBannerText.textContent = `Last attempt at this task stopped ${formatRelativeTime(reason.timestamp)}: ${reason.reason}`;
+    resumeBanner.style.display = "block";
+  } else {
+    resumeBanner.style.display = "none";
+  }
+}
+taskInput.addEventListener("input", refreshResumeBanner);
+refreshResumeBanner();
 
 // --- Vault UI ---
 // vault.js (loaded via <script> tag in popup.html, same context as this
@@ -118,6 +138,7 @@ const POST_ACTION_WAIT_MS = 1500; // fixed settle time after a FILL action (no n
 const NAV_WAIT_TIMEOUT_MS = 8000; // hard ceiling for a CLICK-triggered navigation CHAIN to finish
 const NAV_SETTLE_BUFFER_MS = 600; // window of no tab activity required before considering it settled
 const MIN_POST_CLICK_WAIT_MS = 2000; // floor BEFORE settle-checking even starts, for actions with an invisible pre-navigation delay (e.g. a server round-trip validating a login POST before any redirect begins)
+const NETWORK_RETRY_WAIT_MS = 3000; // longer-than-usual wait before the single automatic retry on a "network_or_loading_issue" error
 
 // Shared state - kept for the manual step buttons, which are still
 // useful for debugging one stage at a time. The automatic loop below
@@ -619,7 +640,7 @@ function waitForTabSettled(tabId, maxTotalWaitMs) {
 // already moved on and (wrongly) concluded the action had no effect.
 // This floor gives that invisible pre-navigation gap room to actually
 // begin before the silence-based settle logic is ever consulted.
-async function waitAfterClick(tabId) {
+async function waitAfterNavigatingAction(tabId) {
   await new Promise((r) => setTimeout(r, MIN_POST_CLICK_WAIT_MS));
   await waitForTabSettled(tabId, NAV_WAIT_TIMEOUT_MS);
 }
@@ -723,7 +744,7 @@ executeBtn.addEventListener("click", async () => {
 // broke the old single-shot flow.
 // ============================================================
 
-runTaskBtn.addEventListener("click", async () => {
+async function runTask() {
   const taskInstruction = taskInput.value.trim();
   if (!taskInstruction) {
     serverResponseEl.textContent = "Enter a task instruction first.";
@@ -731,8 +752,34 @@ runTaskBtn.addEventListener("click", async () => {
   }
 
   runTaskBtn.disabled = true;
+  resumeTaskBtn.disabled = true;
+  resumeBanner.style.display = "none";
   let log = "";
-  let lastActionKey = null; // tracks (action, element_id, label, url) to detect the model repeating itself
+
+  // Tracks how this run ends, decided at the specific point each stop
+  // happens (not guessed afterward from whatever the last log line
+  // happened to be) - "success" clears any stored stop reason for
+  // this exact task; anything else saves stopReasonText as the new
+  // one. Left null if the loop runs out of steps without any explicit
+  // stop or success, which is itself treated as a stop below.
+  let taskOutcome = null; // "success" | "stopped"
+  let stopReasonText = "";
+  // Rolling history of the last two distinct action keys, used to
+  // detect the model repeating itself - both an immediate repeat
+  // (n vs n-1, e.g. clicking the same failing button twice in a row)
+  // and a short oscillation (n vs n-2, e.g. A,B,A - alternating
+  // between two wrong actions rather than genuinely getting stuck on
+  // one). A single previous-action slot could only ever catch the
+  // former; checking membership in a short history catches both with
+  // one check.
+  const ACTION_HISTORY_LENGTH = 2;
+  let actionKeyHistory = [];
+  const recordActionKey = (key) => {
+    actionKeyHistory.push(key);
+    if (actionKeyHistory.length > ACTION_HISTORY_LENGTH) {
+      actionKeyHistory.shift();
+    }
+  };
 
   // Structural completion state for login/signup tasks - scoped to
   // THIS one task run only, reset to nothing every time Run Task is
@@ -747,18 +794,112 @@ runTaskBtn.addEventListener("click", async () => {
   const taskIsAuthTask = /sign\s?up|register|create\s+an?\s+account|create\s+account|log\s?in|sign\s?in/i.test(taskInstruction);
   let taskStartUrl = null;
   let sawPasswordField = false;
+  let networkRetryUsed = false; // whether the single automatic network/loading retry has already been used this task run
 
   const appendLog = (line) => {
     log += line + "\n";
     serverResponseEl.textContent = log;
   };
 
+  // Lock onto the specific window this task is running in ONCE, right
+  // here, at the moment the user clicked Run Task - a genuine
+  // user-intent moment, not something we should have to re-guess
+  // later. Real bug found: chrome.tabs.query({ currentWindow: true })
+  // means "whichever window has OS focus RIGHT NOW", not "the window
+  // this task started in" - if focus shifts to a different Chrome
+  // window at any point mid-task (another testing window left open, a
+  // DevTools panel opened via "Inspect popup" for debugging), that
+  // query silently starts returning a completely unrelated tab, which
+  // the extension was never granted permission to act on, producing a
+  // late, confusing "Extension manifest must request permission"
+  // error on whatever action happens to run next. Querying by this
+  // fixed windowId instead of currentWindow every step means later
+  // focus changes elsewhere can no longer redirect the loop onto the
+  // wrong window's tab.
+  const [initialTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const targetWindowId = initialTab.windowId;
+
   try {
     for (let step = 1; step <= MAX_LOOP_STEPS; step++) {
       appendLog(`--- Step ${step}/${MAX_LOOP_STEPS} ---`);
 
-      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const [activeTab] = await chrome.tabs.query({ active: true, windowId: targetWindowId });
       const tabId = activeTab.id;
+
+      if (step === 1) {
+        taskStartUrl = activeTab.url;
+      }
+
+      // Domain-drift check - MUST run before doCapture()/doDetect(),
+      // not after. Real bug found testing this exact check: a manual
+      // navigation to an unrelated site (e.g. typing google.com into
+      // the address bar mid-task) revokes the extension's script-
+      // injection permission for that tab immediately - attempting
+      // doDetect() against it throws before this check (originally
+      // placed after detection) ever got a chance to run, crashing the
+      // whole loop with a raw permission error instead of recovering.
+      // This check only ever needed activeTab.url, never anything from
+      // detection, so it can - and now does - run first, using
+      // something already available for free. Runs from step 2 onward
+      // (step 1 is what establishes taskStartUrl in the first place).
+      // Catches the general case of ending up somewhere entirely
+      // unintended mid-task - an ad click that navigated away, a
+      // redirect to an unrelated tracking/payment domain - without
+      // needing to guess from nav-link text the way the step-1-only
+      // heuristic below does. Ordinary same-site navigation (e.g.
+      // /login -> /login/validate -> /home) never trips it, since the
+      // hostname stays constant throughout, but a genuine hijack to a
+      // different domain always does.
+      if (step > 1 && taskStartUrl) {
+        let currentHostname = null;
+        let taskHostname = null;
+        try {
+          currentHostname = new URL(activeTab.url).hostname;
+          taskHostname = new URL(taskStartUrl).hostname;
+        } catch (e) {
+          // Malformed/unusual URL (e.g. a data: URL) - skip the check
+          // rather than risk a false positive from a parsing edge case.
+        }
+
+        if (currentHostname && taskHostname && currentHostname !== taskHostname) {
+          appendLog(
+            `\nDetected drift: task started on "${taskHostname}", but the current page is ` +
+            `on "${currentHostname}" - likely an unintended navigation (e.g. an ad click). ` +
+            `Attempting to go back before attempting any detection on a page we may not ` +
+            `have permission to touch.`
+          );
+          try {
+            await chrome.tabs.goBack(tabId);
+          } catch (e) {
+            appendLog(`Failed to go back: ${e.message}`);
+          }
+
+          // Chrome's activeTab permission is a one-time grant tied to
+          // the moment this popup was opened - once a tab visits a
+          // site outside that grant, permission for that tab is
+          // revoked for the rest of this popup session, PERMANENTLY,
+          // regardless of navigating back to the correct site
+          // afterward (confirmed directly: detection failed again on
+          // the very next step, even though the URL had already
+          // correctly returned to the task's own domain). Only
+          // reopening the extension popup - a fresh user action - can
+          // earn a new grant. Rather than optimistically continuing
+          // and crashing on the next detection attempt, stop here with
+          // an honest explanation: goBack() still leaves the user's
+          // browser in the right place, which is real, useful
+          // progress, even though this run can't safely continue.
+          appendLog(
+            `\nNavigated back to the task's site, but Chrome revokes this extension's ` +
+            `temporary page-access permission once a tab visits an unrelated site - even ` +
+            `after returning, this permission cannot be restored within the same run. ` +
+            `Stopping here rather than crashing on the next detection attempt. Click Run ` +
+            `Task again to resume with a fresh permission grant.`
+          );
+          taskOutcome = "stopped";
+          stopReasonText = "Navigated to a different site mid-task and lost page-access permission.";
+          break;
+        }
+      }
 
       appendLog("Capturing and detecting current page state...");
       await doCapture();
@@ -767,9 +908,6 @@ runTaskBtn.addEventListener("click", async () => {
       appendLog(`Found ${fields.length} sensitive region(s), ${clickableElements.length} clickable element(s).`);
       console.log("[VisionGuard debug] clickableElements:", clickableElements);
 
-      if (step === 1) {
-        taskStartUrl = activeTab.url;
-      }
       const hasPasswordFieldNow = fields.some((f) => f.category === "password");
       if (hasPasswordFieldNow) {
         sawPasswordField = true;
@@ -815,11 +953,11 @@ runTaskBtn.addEventListener("click", async () => {
           );
           const navResult = await doExecute(mismatchNav.id, tabId);
           appendLog(navResult.success ? `Clicked: ${navResult.clickedElement}` : `Failed: ${navResult.reason}`);
-          lastActionKey = `click:${mismatchNav.id}:${mismatchNav.label}:${activeTab.url}`;
+          recordActionKey(`click:${mismatchNav.id}:${mismatchNav.label}:${activeTab.url}`);
 
           if (step < MAX_LOOP_STEPS) {
             appendLog("Waiting for page navigation to complete before re-perceiving...\n");
-            await waitAfterClick(tabId);
+            await waitAfterNavigatingAction(tabId);
           }
           continue;
         }
@@ -835,6 +973,8 @@ runTaskBtn.addEventListener("click", async () => {
         appendLog(`\nERROR DETECTED ON PAGE: "${errorResult.result.message}"`);
         appendLog("Stopping - please correct the issue and re-run the task.");
         alert(`VisionGuard detected a page error:\n\n"${errorResult.result.message}"\n\nPlease correct the issue and try again.`);
+        taskOutcome = "stopped";
+        stopReasonText = `Page showed an error: "${errorResult.result.message}"`;
         break;
       }
 
@@ -856,6 +996,7 @@ runTaskBtn.addEventListener("click", async () => {
           `judgment.`
         );
         appendLog("Task complete - stopping here rather than continuing to interact with a completed page.");
+        taskOutcome = "success";
         break;
       }
 
@@ -867,6 +1008,7 @@ runTaskBtn.addEventListener("click", async () => {
       if (successResult.result.found) {
         appendLog(`\nSuccess confirmation detected on page: "${successResult.result.message}"`);
         appendLog("Task complete - stopping here rather than continuing to interact with a completed page.");
+        taskOutcome = "success";
         break;
       }
 
@@ -905,6 +1047,7 @@ runTaskBtn.addEventListener("click", async () => {
           `vault. Treating the task as complete here rather than asking the model to ` +
           `invent a next action it was never asked to take.`
         );
+        taskOutcome = "success";
         break;
       }
 
@@ -915,9 +1058,38 @@ runTaskBtn.addEventListener("click", async () => {
 
       if (response.error_detected && response.error_message) {
         const categoryLabel = response.error_category ? ` [${response.error_category}]` : "";
+
+        // Narrow, capped corrective action for exactly ONE error
+        // category. A network/loading issue is often transient (a
+        // slow page, a momentary connectivity blip), unlike every
+        // other category, where retrying could actively make things
+        // worse (e.g. resubmitting the same wrong credentials, or
+        // re-triggering an already-exists conflict) - so this is the
+        // one case where waiting longer and looking again is a safe,
+        // reasonable response to try, capped at exactly once per task
+        // run. The model's own behavior is unchanged by this: it still
+        // always reports the error and stops choosing an action, per
+        // the server prompt; this retry decision is made entirely
+        // client-side, based on the category alone.
+        if (response.error_category === "network_or_loading_issue" && !networkRetryUsed) {
+          networkRetryUsed = true;
+          appendLog(
+            `\nModel reported a network/loading issue${categoryLabel}: ` +
+            `"${response.error_message}". This category is often transient, so ` +
+            `trying once more after a longer wait, rather than stopping ` +
+            `immediately.`
+          );
+          if (step < MAX_LOOP_STEPS) {
+            await new Promise((r) => setTimeout(r, NETWORK_RETRY_WAIT_MS));
+          }
+          continue;
+        }
+
         appendLog(`\nERROR DETECTED (model-reported)${categoryLabel}: ${response.error_message}`);
         appendLog("Stopping - please correct the issue and re-run the task.");
         alert(`VisionGuard detected a page error${categoryLabel}:\n\n"${response.error_message}"\n\nPlease correct the issue and try again.`);
+        taskOutcome = "stopped";
+        stopReasonText = `Page showed an error: "${response.error_message}"`;
         break;
       }
 
@@ -930,8 +1102,11 @@ runTaskBtn.addEventListener("click", async () => {
             "gave up rather than guess, but the task was not actually " +
             "finished."
           );
+          taskOutcome = "stopped";
+          stopReasonText = "The AI's last suggested action was invalid and got rejected.";
         } else {
           appendLog("\nTask complete - model reports no further action needed.");
+          taskOutcome = "success";
         }
         break;
       }
@@ -941,18 +1116,21 @@ runTaskBtn.addEventListener("click", async () => {
       if (response.action === "click" && response.element_id != null) {
         const targetLabel = (clickableElements.find((el) => el.id === response.element_id) || {}).label || "";
         const actionKey = `${response.action}:${response.element_id}:${targetLabel}:${activeTab.url}`;
-        if (actionKey === lastActionKey) {
+        if (actionKeyHistory.includes(actionKey)) {
           appendLog(
-            `\nStopping - model chose the same action twice in a row on the ` +
-            `same page (element #${response.element_id}, "${targetLabel}"). ` +
-            `This usually means the action isn't producing the expected page ` +
-            `change (e.g. a login attempt that fails and returns to the same ` +
-            `form). The model has no memory of prior steps to recognize this ` +
-            `on its own, so the loop stops here rather than repeating uselessly.`
+            `\nStopping - model chose an action it already tried within the last ` +
+            `${ACTION_HISTORY_LENGTH} attempts on this same page (element ` +
+            `#${response.element_id}, "${targetLabel}"). This usually means the ` +
+            `action isn't producing the expected page change - either an ` +
+            `immediate repeat, or a short back-and-forth between a couple of ` +
+            `wrong actions. The model has no memory of prior steps to recognize ` +
+            `this on its own, so the loop stops here rather than repeating uselessly.`
           );
+          taskOutcome = "stopped";
+          stopReasonText = "Got stuck repeating (or alternating between) the same click(s).";
           break;
         }
-        lastActionKey = actionKey;
+        recordActionKey(actionKey);
         actionMightNavigate = true;
 
         appendLog(`Executing click on element #${response.element_id}...`);
@@ -961,23 +1139,29 @@ runTaskBtn.addEventListener("click", async () => {
 
         if (!execResult.success) {
           appendLog("\nStopping loop - execution failed.");
+          taskOutcome = "stopped";
+          stopReasonText = `Failed to click an element: ${execResult.reason}`;
           break;
         }
       } else if (response.action === "type" && response.element_id != null && response.value_type) {
         const targetLabel = (clickableElements.find((el) => el.id === response.element_id) || {}).label || "";
         const actionKey = `${response.action}:${response.element_id}:${response.value_type}:${targetLabel}:${activeTab.url}`;
-        if (actionKey === lastActionKey) {
+        if (actionKeyHistory.includes(actionKey)) {
           appendLog(
-            `\nStopping - model chose the same type action twice in a row on the ` +
-            `same page (element #${response.element_id}, ${response.value_type}, ` +
-            `"${targetLabel}"). This usually means the field already has a value ` +
-            `the model isn't recognizing as filled (for example, a redacted field ` +
-            `showing a placeholder in the image the model sees, rather than the ` +
-            `real content). The loop stops here rather than repeating uselessly.`
+            `\nStopping - model chose a type action it already tried within the ` +
+            `last ${ACTION_HISTORY_LENGTH} attempts on this same page (element ` +
+            `#${response.element_id}, ${response.value_type}, "${targetLabel}"). ` +
+            `This usually means the field already has a value the model isn't ` +
+            `recognizing as filled (for example, a redacted field showing a ` +
+            `placeholder in the image the model sees, rather than the real ` +
+            `content), or a short back-and-forth between a couple of wrong ` +
+            `actions. The loop stops here rather than repeating uselessly.`
           );
+          taskOutcome = "stopped";
+          stopReasonText = "Got stuck repeating (or alternating between) the same fill action(s).";
           break;
         }
-        lastActionKey = actionKey;
+        recordActionKey(actionKey);
 
         appendLog(`Filling element #${response.element_id} with vault value (${response.value_type})...`);
         const fillResult = await doFill(response.element_id, response.value_type, tabId);
@@ -986,33 +1170,67 @@ runTaskBtn.addEventListener("click", async () => {
           appendLog(`\nVault has no saved "${fillResult.valueType}" value.`);
           alert(`VisionGuard needs your "${fillResult.valueType}" to continue this task, but nothing is saved in the vault yet.\n\nOpen the extension popup, fill in the Vault section, and run the task again.`);
           appendLog("Stopping - please add this to your vault and re-run the task.");
+          taskOutcome = "stopped";
+          stopReasonText = `Needed a "${fillResult.valueType}" value that isn't saved in the vault yet.`;
           break;
         }
 
         appendLog(fillResult.success ? `Filled: ${fillResult.filledElement}` : `Failed: ${fillResult.reason}`);
         if (!fillResult.success) {
           appendLog("\nStopping loop - fill failed.");
+          taskOutcome = "stopped";
+          stopReasonText = `Failed to fill a field: ${fillResult.reason}`;
           break;
         }
       } else {
         appendLog("\nStopping loop - no actionable response returned.");
+        taskOutcome = "stopped";
+        stopReasonText = "The AI didn't return a usable next action.";
         break;
       }
 
       if (step < MAX_LOOP_STEPS) {
         if (actionMightNavigate) {
           appendLog("Waiting for page navigation to complete before re-perceiving...\n");
-          await waitAfterClick(tabId);
+          await waitAfterNavigatingAction(tabId);
         } else {
           appendLog(`Waiting ${POST_ACTION_WAIT_MS}ms for page to settle before re-perceiving...\n`);
           await new Promise((r) => setTimeout(r, POST_ACTION_WAIT_MS));
         }
       }
     }
+
+    // Reaching here (loop condition became false rather than an
+    // explicit break) means every step ran without success or an
+    // explicit stop - genuinely ran out of room, not the same as any
+    // of the specific reasons above.
+    if (taskOutcome === null) {
+      appendLog(`\nReached the maximum number of steps (${MAX_LOOP_STEPS}) without finishing.`);
+      taskOutcome = "stopped";
+      stopReasonText = `Reached the maximum number of steps (${MAX_LOOP_STEPS}) without finishing.`;
+    }
   } catch (err) {
     appendLog(`\nLoop error: ${err.message}`);
     console.error("[VisionGuard] task loop failed:", err);
+    taskOutcome = "stopped";
+    stopReasonText = `Crashed with an error: ${err.message}`;
   } finally {
     runTaskBtn.disabled = false;
+    resumeTaskBtn.disabled = false;
+
+    // Local-only record of why this task stopped, keyed to this exact
+    // task's text - cleared the moment it succeeds, overwritten with
+    // the latest reason otherwise. Never sent anywhere, never used for
+    // anything but showing a short "resume?" hint next time this same
+    // task is typed in.
+    if (taskOutcome === "success") {
+      await clearTaskStopReason(taskInstruction);
+    } else {
+      await saveTaskStopReason(taskInstruction, stopReasonText || "Stopped for an unknown reason.");
+    }
+    await refreshResumeBanner();
   }
-});
+}
+
+runTaskBtn.addEventListener("click", runTask);
+resumeTaskBtn.addEventListener("click", runTask);

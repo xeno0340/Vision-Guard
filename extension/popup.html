@@ -95,6 +95,14 @@
            border-radius: 6px; font-family: inherit; font-size: 12px; resize: vertical;"
     rows="2"></textarea>
 
+  <div id="resumeBanner" style="display: none; margin-top: 8px; padding: 8px;
+       background: #3a2f1a; border: 1px solid #6b5a2f; border-radius: 6px;
+       font-size: 11px; color: #d9c589;">
+    <div id="resumeBannerText"></div>
+    <button id="resumeTaskBtn" style="width: 100%; margin-top: 6px; padding: 6px;
+      font-size: 12px; background: #8a6d1f;">Resume this task</button>
+  </div>
+
   <button id="sendBtn" style="margin-top: 8px;">Send redacted image to server</button>
   <button id="executeBtn" style="margin-top: 8px; background: #1D9E75;">Execute returned action</button>
   <button id="runTaskBtn" style="margin-top: 12px; background: #7F77DD; font-weight: bold;">▶ Run Task (auto, multi-step)</button>
@@ -106,6 +114,7 @@
   <script src="lib/ort.min.js"></script>
   <script src="face-detector.js"></script>
   <script src="vault.js"></script>
+  <script src="task-history.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

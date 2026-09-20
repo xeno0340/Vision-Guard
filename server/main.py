@@ -245,6 +245,15 @@ def agent_step(ctx: RedactedContext):
             },
             timeout=60,
         )
+        if not response.ok:
+            # response.raise_for_status() alone throws away Ollama's own
+            # explanation of what went wrong, leaving only a generic
+            # "500 Server Error" with no detail - printing the actual
+            # response body first means the real cause (out of memory,
+            # a malformed request, a model that failed to load, etc.)
+            # shows up directly in this terminal instead of requiring a
+            # separate hunt through Ollama's own log files.
+            print(f"[VisionGuard] Ollama returned {response.status_code}: {response.text[:1000]}")
         response.raise_for_status()
         raw_model_output = response.json()["response"]
         print(f"[VisionGuard] raw model output: {raw_model_output[:300]}")
