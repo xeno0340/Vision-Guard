@@ -8,7 +8,9 @@
       "id": "visionguard@sih2026.local",
       "strict_min_version": "140.0",
       "data_collection_permissions": {
-        "required": ["none"]
+        "required": [
+          "none"
+        ]
       }
     }
   },
@@ -29,7 +31,11 @@
     "default_title": "VisionGuard"
   },
   "background": {
-    "scripts": ["background.js"]
+    "scripts": [
+      "background.js"
+    ]
   },
-  "optional_host_permissions": ["<all_urls>"]
+  "optional_host_permissions": [
+    "<all_urls>"
+  ]
 }

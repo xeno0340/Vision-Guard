@@ -24,7 +24,7 @@
 function detectAndTagPopupClose() {
   const isTopFrame = window.top === window;
 
-  const CLOSE_LABEL_PATTERN = /^close$|^dismiss$|^no,?\s*thanks$|^skip( ad)?$|^\u00d7$|^\u2715$|^\u2716$|^x$/i;
+  const CLOSE_LABEL_PATTERN = /^close$|^close ad$|^dismiss$|^no,?\s*thanks$|^skip( ad)?$|^\u00d7$|^\u2715$|^\u2716$|^x$/i;
   const CLOSE_HINT_PATTERN = /close|dismiss|modal.?close|popup.?close|ad.?close/i;
 
   function looksLikeCloseControl(el) {

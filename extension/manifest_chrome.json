@@ -3,15 +3,6 @@
   "name": "VisionGuard",
   "version": "0.1.0",
   "description": "Privacy-preserving vision agent - captures and redacts screen content locally before any server call.",
-  "browser_specific_settings": {
-    "gecko": {
-      "id": "visionguard@sih2026.local",
-      "strict_min_version": "140.0",
-      "data_collection_permissions": {
-        "required": ["none"]
-      }
-    }
-  },
   "permissions": [
     "activeTab",
     "tabs",
@@ -29,7 +20,9 @@
     "default_title": "VisionGuard"
   },
   "background": {
-    "scripts": ["background.js"]
+    "service_worker": "background.js"
   },
-  "optional_host_permissions": ["<all_urls>"]
+  "optional_host_permissions": [
+    "<all_urls>"
+  ]
 }

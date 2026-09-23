@@ -62,13 +62,27 @@ const viewFullSizeBtn = document.getElementById("viewFullSizeBtn");
 // LOOKS blurry when squeezed into that small a space, purely from CSS
 // downscaling, not because the underlying image is actually low-res.
 // Opening the same image at full size in a real tab fixes this.
+//
+// Uses a blob: URL, not a data: URL. Real cross-browser difference
+// found during the Firefox port: Chrome's tabs.create() accepts a
+// data: URL directly, but Firefox deliberately rejects it as an
+// invalid URL (confirmed in Firefox's own test suite) - not a bug,
+// a genuine platform difference. blob: URLs are supported by both
+// browsers' tabs.create() identically, so this needs no browser-
+// specific branch at all.
 viewFullSizeBtn.addEventListener("click", () => {
   if (redactedCanvas.width === 0) {
     alert("Nothing to view yet - run Redact and preview first.");
     return;
   }
-  const dataUrl = redactedCanvas.toDataURL("image/png");
-  chrome.tabs.create({ url: dataUrl });
+  redactedCanvas.toBlob((blob) => {
+    if (!blob) {
+      alert("Could not generate the full-size image.");
+      return;
+    }
+    const blobUrl = URL.createObjectURL(blob);
+    chrome.tabs.create({ url: blobUrl });
+  }, "image/png");
 });
 const executeBtn = document.getElementById("executeBtn");
 const taskInput = document.getElementById("taskInput");
@@ -134,10 +148,12 @@ saveVaultBtn.addEventListener("click", async () => {
 
 const SERVER_URL = "http://localhost:8000/agent/step";
 const MAX_LOOP_STEPS = 6;
+const MAX_CLICKABLE_ELEMENTS_SENT = 40; // hard cap on how many elements are drawn/sent per step, regardless of page complexity - see doDetect() for how fillable elements are always kept ahead of this cap
 const POST_ACTION_WAIT_MS = 1500; // fixed settle time after a FILL action (no navigation expected)
 const NAV_WAIT_TIMEOUT_MS = 8000; // hard ceiling for a CLICK-triggered navigation CHAIN to finish
 const NAV_SETTLE_BUFFER_MS = 600; // window of no tab activity required before considering it settled
 const MIN_POST_CLICK_WAIT_MS = 2000; // floor BEFORE settle-checking even starts, for actions with an invisible pre-navigation delay (e.g. a server round-trip validating a login POST before any redirect begins)
+const POPUP_CHECK_TIMEOUT_MS = 6000; // hard ceiling on the whole popup/overlay check - a page with many (or slow/hung) iframes, e.g. a full-page ad interstitial, could otherwise block the loop indefinitely, since scripting.executeScript with allFrames:true has no built-in timeout of its own
 const NETWORK_RETRY_WAIT_MS = 3000; // longer-than-usual wait before the single automatic retry on a "network_or_loading_issue" error
 
 // Shared state - kept for the manual step buttons, which are still
@@ -345,6 +361,68 @@ function executeFillByElementId(elementId, value) {
   return { success: true, filledElement: el.tagName + (el.id ? `#${el.id}` : ""), value };
 }
 
+// Deterministic auto-submit for exactly ONE narrow, safe case: a
+// literal-text field that was just filled sits inside a <form> that
+// contains ONLY that one text-like field - a classic single-box search
+// form. Direct evidence this is needed: the model was asked (via
+// explicit prompt guidance) to recognize "field is filled, click
+// submit next" instead of retyping, and reproducibly did not do this
+// reliably, the same pattern seen repeatedly elsewhere in this project
+// for judgment calls left to the model alone. Rather than ask again,
+// this is caught in code.
+//
+// Deliberately does NOT fire when the form has more than one text-like
+// field - auto-submitting the moment ANY field in a multi-field form
+// (e.g. a future email compose form's To/Subject/Body) gets filled
+// would be actively harmful, submitting prematurely before the rest of
+// the form is even filled in. Only a genuinely single-purpose form is
+// safe to treat "filled" as "ready to go."
+function autoSubmitIfSingleFieldForm(elementId) {
+  function findDeep(selector, root) {
+    root = root || document;
+    const direct = root.querySelector(selector);
+    if (direct) return direct;
+    const hosts = root.querySelectorAll("*");
+    for (const h of hosts) {
+      if (h.shadowRoot) {
+        const found = findDeep(selector, h.shadowRoot);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  const el = findDeep(`[data-visionguard-id="${elementId}"]`);
+  if (!el) return { attempted: false, reason: "field not found" };
+
+  const form = el.closest("form");
+  if (!form) return { attempted: false, reason: "not inside a form" };
+
+  const textLikeFields = form.querySelectorAll(
+    'input[type="text"], input[type="search"], input:not([type]), textarea'
+  );
+  if (textLikeFields.length !== 1) {
+    return { attempted: false, reason: `form has ${textLikeFields.length} text field(s), not exactly 1` };
+  }
+
+  const submitEl = form.querySelector('button[type="submit"], input[type="submit"], button:not([type])');
+  if (!submitEl) return { attempted: false, reason: "no submit control found in form" };
+
+  const rect = submitEl.getBoundingClientRect();
+  const cx = rect.x + rect.width / 2;
+  const cy = rect.y + rect.height / 2;
+  const opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
+  submitEl.dispatchEvent(new MouseEvent("mousedown", opts));
+  submitEl.dispatchEvent(new MouseEvent("mouseup", opts));
+  submitEl.dispatchEvent(new MouseEvent("click", opts));
+
+  return {
+    attempted: true,
+    success: true,
+    clickedElement: submitEl.tagName + (submitEl.id ? `#${submitEl.id}` : ""),
+  };
+}
+
 // ============================================================
 // Reusable step functions - each does ONE thing and returns its
 // result. Both the manual buttons and the automatic loop call these,
@@ -365,11 +443,14 @@ async function doDetect(tabId) {
     tabId = tab.id;
   }
 
+  console.log("[VisionGuard debug] doDetect: injecting dom-detector.js...");
   await chrome.scripting.executeScript({ target: { tabId }, files: ["dom-detector.js"] });
+  console.log("[VisionGuard debug] doDetect: dom-detector.js injected OK, calling detectSensitiveFields()...");
   const [domResult] = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => detectSensitiveFields(),
   });
+  console.log("[VisionGuard debug] doDetect: detectSensitiveFields() OK");
   const { fields, devicePixelRatio } = domResult.result;
   lastActualDevicePixelRatio = devicePixelRatio;
 
@@ -384,19 +465,45 @@ async function doDetect(tabId) {
 
   let allFields = domFieldsScaled;
   if (lastCaptureDataUrl) {
+    console.log("[VisionGuard debug] doDetect: running face detection...");
     const faces = await detectFacesInDataUrl(lastCaptureDataUrl);
+    console.log("[VisionGuard debug] doDetect: face detection OK");
     allFields = allFields.concat(faces);
   }
 
   lastDetectedFields = allFields;
   lastDevicePixelRatio = 1;
 
+  console.log("[VisionGuard debug] doDetect: injecting clickable-detector.js...");
   await chrome.scripting.executeScript({ target: { tabId }, files: ["clickable-detector.js"] });
+  console.log("[VisionGuard debug] doDetect: clickable-detector.js injected OK, calling detectClickableElements()...");
   const [clickableResult] = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => detectClickableElements(),
   });
-  lastClickableElements = clickableResult.result.elements;
+  console.log("[VisionGuard debug] doDetect: detectClickableElements() OK - doDetect() complete");
+  // Real gap found testing against a genuinely busy real-world page
+  // (Amazon's homepage, 71 clickable elements): sending every detected
+  // element unconditionally made a single request exceed the model's
+  // context window outright (measured 5040 tokens against a 4096
+  // limit), regardless of how much context headroom the server side
+  // is given - an even busier page would eventually exceed any fixed
+  // limit. Capping here keeps prompt size bounded no matter how
+  // complex the page is, which matters for the latency/resource-
+  // utilization side of the evaluation criteria too, not just
+  // avoiding the crash. Fillable fields are always kept in full (the
+  // task usually needs to reach one of them); only the overflow of
+  // plain clickable elements gets trimmed, keeping their original
+  // top-to-bottom detection order so the earliest, typically most
+  // prominent items on the page are the ones kept.
+  let detectedElements = clickableResult.result.elements;
+  if (detectedElements.length > MAX_CLICKABLE_ELEMENTS_SENT) {
+    const fillable = detectedElements.filter((el) => el.kind === "fillable");
+    const clickableOnly = detectedElements.filter((el) => el.kind !== "fillable");
+    const remainingBudget = Math.max(0, MAX_CLICKABLE_ELEMENTS_SENT - fillable.length);
+    detectedElements = fillable.concat(clickableOnly.slice(0, remainingBudget));
+  }
+  lastClickableElements = detectedElements;
 
   return { fields: allFields, clickableElements: lastClickableElements };
 }
@@ -502,33 +609,45 @@ async function doExecute(elementId, tabId) {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     tabId = tab.id;
   }
+  console.log("[VisionGuard debug] doExecute: calling executeScript with a direct func: reference (no prior files: injection)...");
   const [result] = await chrome.scripting.executeScript({
     target: { tabId },
     func: executeClickByElementId,
     args: [elementId],
   });
+  console.log("[VisionGuard debug] doExecute: executeScript with direct func: reference OK");
   return result.result;
 }
 
-async function doFill(elementId, valueType, tabId) {
-  const vault = await getVault();
-
+async function doFill(elementId, valueType, tabId, literalValue) {
   let value;
-  if (valueType === "first_name" || valueType === "last_name") {
-    const nameParts = (vault.name || "").trim().split(/\s+/).filter(Boolean);
-    if (nameParts.length === 0) {
-      value = null;
-    } else if (valueType === "first_name") {
-      value = nameParts[0];
-    } else {
-      value = nameParts.length > 1 ? nameParts.slice(1).join(" ") : nameParts[0];
-    }
-  } else {
-    value = vault[valueType];
-  }
 
-  if (!value) {
-    return { success: false, needsVaultEntry: true, valueType: valueType === "first_name" || valueType === "last_name" ? "name" : valueType };
+  if (valueType === "literal") {
+    // Model-generated text (a search term, a message body) rather than
+    // a vault lookup - the server has already validated this went
+    // through its own checks (non-empty, length-capped, label isn't
+    // sensitive-looking) before ever reaching here, so this path just
+    // uses the value as given, the same way a vault value is used
+    // as-is once resolved.
+    value = literalValue;
+  } else {
+    const vault = await getVault();
+    if (valueType === "first_name" || valueType === "last_name") {
+      const nameParts = (vault.name || "").trim().split(/\s+/).filter(Boolean);
+      if (nameParts.length === 0) {
+        value = null;
+      } else if (valueType === "first_name") {
+        value = nameParts[0];
+      } else {
+        value = nameParts.length > 1 ? nameParts.slice(1).join(" ") : nameParts[0];
+      }
+    } else {
+      value = vault[valueType];
+    }
+
+    if (!value) {
+      return { success: false, needsVaultEntry: true, valueType: valueType === "first_name" || valueType === "last_name" ? "name" : valueType };
+    }
   }
 
   const [result] = await chrome.scripting.executeScript({
@@ -543,16 +662,45 @@ async function doFill(elementId, valueType, tabId) {
 // (including cross-origin iframes, via allFrames: true) and, if found,
 // clicks its close control directly - no model call involved, same
 // "catch it in code" pattern as the error/success detectors below.
+// Races any promise against a hard time ceiling. Real gap found: a
+// page with an unusually heavy or slow-loading ad presence (a
+// full-page interstitial format, several ad iframes at once) could
+// leave checkAndDismissPopup() waiting indefinitely, since
+// scripting.executeScript with allFrames:true has no timeout of its
+// own - unlike almost every other wait in this loop, which already
+// has an explicit ceiling for exactly this reason. On timeout, resolve
+// to the given fallback value rather than rejecting, so the caller can
+// just treat it as "nothing found" and keep the task moving instead of
+// crashing the whole run over one slow page.
+function withTimeout(promise, ms, fallbackValue) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallbackValue), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(fallbackValue);
+      }
+    );
+  });
+}
+
 async function checkAndDismissPopup(tabId) {
+  console.log("[VisionGuard debug] checkAndDismissPopup: injecting popup-detector.js (allFrames)...");
   await chrome.scripting.executeScript({
     target: { tabId, allFrames: true },
     files: ["popup-detector.js"],
   });
+  console.log("[VisionGuard debug] checkAndDismissPopup: popup-detector.js injected OK, calling detectAndTagPopupClose() (allFrames)...");
 
   const detectionResults = await chrome.scripting.executeScript({
     target: { tabId, allFrames: true },
     func: () => detectAndTagPopupClose(),
   });
+  console.log("[VisionGuard debug] checkAndDismissPopup: detectAndTagPopupClose() OK across all frames");
 
   const hit = detectionResults.find((r) => r.result && r.result.found);
   if (!hit) return { found: false };
@@ -754,6 +902,64 @@ async function runTask() {
   runTaskBtn.disabled = true;
   resumeTaskBtn.disabled = true;
   resumeBanner.style.display = "none";
+  // Firefox-only permission handling - detected via the presence of
+  // the global `browser` object, which Firefox exposes natively and
+  // Chrome does not (Chrome only exposes `chrome`). Gated to Firefox
+  // specifically because Chrome's own activeTab grant has reliably
+  // survived in-tab navigation throughout this whole project without
+  // ever needing this broader permission - adding this check
+  // unconditionally would cost Chrome users a one-time "allow access
+  // to all websites" prompt for a problem Chrome doesn't actually have.
+  //
+  // Requests the literal "<all_urls>" special permission, not the
+  // equivalent-looking ["http://*/*", "https://*/*"] pattern pair used
+  // originally. Real gap found: tabs.captureVisibleTab() kept failing
+  // with "Missing activeTab permission" specifically on any capture
+  // AFTER a real in-tab navigation (confirmed by two other tasks that
+  // never happened to re-capture post-navigation working perfectly
+  // fine), even though the wildcard patterns were granted and
+  // scripting.executeScript() worked reliably post-navigation every
+  // time. MDN documents captureVisibleTab() as needing activeTab OR
+  // the "<all_urls>" permission specifically - Firefox's internal
+  // check for this one API appears to look for that literal special
+  // permission rather than doing equivalent match-pattern coverage the
+  // way script-injection permission checks do.
+  const isFirefox = typeof browser !== "undefined";
+
+  if (isFirefox) {
+    let hasPermission = false;
+    try {
+      hasPermission = await chrome.permissions.contains({ origins: ["<all_urls>"] });
+    } catch (e) {
+      hasPermission = false;
+    }
+
+    if (!hasPermission) {
+      serverResponseEl.textContent =
+        "VisionGuard needs permission to read and act on pages to run a task. " +
+        "Requesting it now - a browser prompt should appear (it may close this " +
+        "popup). Once you respond to it, reopen VisionGuard and click " +
+        "\"Run Task\" again to actually start.";
+      let granted = false;
+      try {
+        granted = await chrome.permissions.request({ origins: ["<all_urls>"] });
+      } catch (e) {
+        granted = false;
+      }
+      // Deliberately not branching on granted/denied here, and not
+      // falling through into the task loop either way: by the time
+      // request() resolves, this popup may already be gone (see above),
+      // so there is no reliable further UI to update regardless of the
+      // outcome. If the popup DID survive (e.g. on a browser where the
+      // dialog doesn't force-close it), this at least leaves the button
+      // states sane rather than stuck disabled.
+      runTaskBtn.disabled = false;
+      resumeTaskBtn.disabled = false;
+      return;
+    }
+  }
+
+
   let log = "";
 
   // Tracks how this run ends, decided at the specific point each stop
@@ -802,20 +1008,21 @@ async function runTask() {
   };
 
   // Lock onto the specific window this task is running in ONCE, right
-  // here, at the moment the user clicked Run Task - a genuine
-  // user-intent moment, not something we should have to re-guess
-  // later. Real bug found: chrome.tabs.query({ currentWindow: true })
-  // means "whichever window has OS focus RIGHT NOW", not "the window
-  // this task started in" - if focus shifts to a different Chrome
-  // window at any point mid-task (another testing window left open, a
-  // DevTools panel opened via "Inspect popup" for debugging), that
-  // query silently starts returning a completely unrelated tab, which
-  // the extension was never granted permission to act on, producing a
-  // late, confusing "Extension manifest must request permission"
-  // error on whatever action happens to run next. Querying by this
-  // fixed windowId instead of currentWindow every step means later
-  // focus changes elsewhere can no longer redirect the loop onto the
-  // wrong window's tab.
+  // here - a genuine user-intent moment, not something we should have
+  // to re-guess later. Real bug found: chrome.tabs.query({
+  // currentWindow: true }) means "whichever window has OS focus RIGHT
+  // NOW", not "the window this task started in" - if focus shifts to a
+  // different Chrome window at any point mid-task (another testing
+  // window left open, a DevTools panel opened via "Inspect popup" for
+  // debugging), that query silently starts returning a completely
+  // unrelated tab, which the extension was never granted permission to
+  // act on, producing a late, confusing permission error on whatever
+  // action happens to run next. Querying by this fixed windowId
+  // instead of currentWindow every step means later focus changes
+  // elsewhere can no longer redirect the loop onto the wrong window's
+  // tab. This now runs AFTER the permission request above (rather than
+  // before, as in the previous version), specifically so the
+  // permission prompt fires with no intervening await.
   const [initialTab] = await chrome.tabs.query({ active: true, currentWindow: true });
   const targetWindowId = initialTab.windowId;
 
@@ -902,8 +1109,11 @@ async function runTask() {
       }
 
       appendLog("Capturing and detecting current page state...");
+      appendLog("[debug] calling doCapture()...");
       await doCapture();
+      appendLog("[debug] doCapture() succeeded, calling doDetect()...");
       const { fields, clickableElements } = await doDetect(tabId);
+      appendLog("[debug] doDetect() succeeded, calling doRedact()...");
       await doRedact();
       appendLog(`Found ${fields.length} sensitive region(s), ${clickableElements.length} clickable element(s).`);
       console.log("[VisionGuard debug] clickableElements:", clickableElements);
@@ -914,7 +1124,17 @@ async function runTask() {
       }
 
       appendLog("Checking for blocking popups/overlays (including ad iframes)...");
-      const popupCheck = await checkAndDismissPopup(tabId);
+      const popupCheck = await withTimeout(
+        checkAndDismissPopup(tabId),
+        POPUP_CHECK_TIMEOUT_MS,
+        { found: false, timedOut: true }
+      );
+      if (popupCheck.timedOut) {
+        appendLog(
+          `Popup/overlay check took too long (over ${POPUP_CHECK_TIMEOUT_MS / 1000}s, likely a ` +
+          `slow or heavy ad iframe) - skipping it for this step rather than blocking the task.`
+        );
+      }
       if (popupCheck.found) {
         appendLog(
           `Popup/overlay detected in ${popupCheck.frameContext === "iframe" ? "a cross-origin iframe (likely an ad)" : "the page"} ` +
@@ -1040,12 +1260,36 @@ async function runTask() {
         continue;
       }
 
+      // If the task explicitly says not to submit/click further, OR the
+      // task's whole wording IS essentially just "autofill" with no
+      // further qualifier (a plain "autofill" or "fill the form" task,
+      // nothing implying an additional action like submit/log in/
+      // search), and there's nothing left for the deterministic
+      // auto-fill pass to fill, the task is genuinely done - full stop,
+      // no model call. Without this, the model has no concept of "the
+      // task was only ever autofill" and will wander into clicking
+      // something else once filling is finished. Real cases observed:
+      // (1) with an explicit "don't submit" instruction, it correctly
+      // avoided the Submit button, then clicked "Sign in to Google"
+      // instead; (2) with a bare "autofill" task and no explicit
+      // qualifier, it clicked a clearly-unrelated test button while its
+      // OWN reasoning note said, verbatim, that the button "is not
+      // relevant to autofilling" - a direct self-contradiction, not a
+      // borderline judgment call, and further evidence this specific
+      // "recognize there's nothing left to do" decision isn't reliable
+      // left to the model alone.
       const taskSaysNoSubmit = /\bdon'?t\s+submit\b|\bdo\s+not\s+submit\b|without\s+submitting/i.test(taskInstruction);
-      if (taskSaysNoSubmit && step > 1) {
+      const taskIsAutofillOnly = /^\s*(auto-?fill|fill (in |out )?(the )?form)\s*$/i.test(taskInstruction);
+      if ((taskSaysNoSubmit || taskIsAutofillOnly) && step > 1) {
         appendLog(
-          `\nTask says not to submit, and there's nothing left to auto-fill from the ` +
-          `vault. Treating the task as complete here rather than asking the model to ` +
-          `invent a next action it was never asked to take.`
+          taskIsAutofillOnly
+            ? `\nTask is just "autofill" with no further qualifier, and there's nothing ` +
+              `left to auto-fill from the vault. Treating the task as complete here ` +
+              `rather than asking the model to invent a next action it was never asked ` +
+              `to take.`
+            : `\nTask says not to submit, and there's nothing left to auto-fill from the ` +
+              `vault. Treating the task as complete here rather than asking the model to ` +
+              `invent a next action it was never asked to take.`
         );
         taskOutcome = "success";
         break;
@@ -1145,7 +1389,14 @@ async function runTask() {
         }
       } else if (response.action === "type" && response.element_id != null && response.value_type) {
         const targetLabel = (clickableElements.find((el) => el.id === response.element_id) || {}).label || "";
-        const actionKey = `${response.action}:${response.element_id}:${response.value_type}:${targetLabel}:${activeTab.url}`;
+        // For a literal (model-generated) fill, fold the actual text
+        // into the key too - otherwise every literal fill would share
+        // the exact same key ("type:11:literal:Search:url") regardless
+        // of what text was generated, and a second, genuinely different
+        // search term typed into the same field would be wrongly
+        // flagged as a repeat of the first.
+        const literalKeyPart = response.value_type === "literal" ? `:${response.literal_value}` : "";
+        const actionKey = `${response.action}:${response.element_id}:${response.value_type}${literalKeyPart}:${targetLabel}:${activeTab.url}`;
         if (actionKeyHistory.includes(actionKey)) {
           appendLog(
             `\nStopping - model chose a type action it already tried within the ` +
@@ -1163,8 +1414,12 @@ async function runTask() {
         }
         recordActionKey(actionKey);
 
-        appendLog(`Filling element #${response.element_id} with vault value (${response.value_type})...`);
-        const fillResult = await doFill(response.element_id, response.value_type, tabId);
+        appendLog(
+          response.value_type === "literal"
+            ? `Filling element #${response.element_id} with generated text: "${response.literal_value}"...`
+            : `Filling element #${response.element_id} with vault value (${response.value_type})...`
+        );
+        const fillResult = await doFill(response.element_id, response.value_type, tabId, response.literal_value);
 
         if (fillResult.needsVaultEntry) {
           appendLog(`\nVault has no saved "${fillResult.valueType}" value.`);
@@ -1181,6 +1436,54 @@ async function runTask() {
           taskOutcome = "stopped";
           stopReasonText = `Failed to fill a field: ${fillResult.reason}`;
           break;
+        }
+
+        // Deterministic auto-submit, literal-text fills only, and only
+        // when safe (see autoSubmitIfSingleFieldForm's own comment for
+        // why this is scoped so narrowly). Asked of the model first via
+        // explicit prompt guidance; reproducibly did not follow it
+        // reliably, so this is now caught in code instead.
+        if (response.value_type === "literal" && fillResult.success) {
+          const [submitResult] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: autoSubmitIfSingleFieldForm,
+            args: [response.element_id],
+          });
+          if (submitResult.result.attempted) {
+            appendLog(
+              `Field is the only one in its form - auto-submitting rather than ` +
+              `risking the model retyping into it again: clicked ${submitResult.result.clickedElement}.`
+            );
+
+            if (submitResult.result.success) {
+              // Submitting a single-box form IS completing a plain
+              // "search/find/look up X" task - stop here rather than
+              // looping back for another model call. Real gap found
+              // testing this exact flow: without this, the loop asked
+              // the model again on the results page, which then made
+              // the SAME "retype into an already-filled field" mistake
+              // a second time (the search bar stays populated with the
+              // query on the results page), ending the run on a
+              // rejected-response message even though the actual task
+              // had already genuinely succeeded moments earlier. This
+              // does not cover a task that needs MORE than search-and-
+              // submit (e.g. also opening or comparing results) - that
+              // remains out of scope, same as the rest of cross-page
+              // reasoning.
+              appendLog(
+                "\nTask complete - submitted the search. Stopping here rather " +
+                "than risking a follow-up step on the results page repeating " +
+                "the same fill by mistake."
+              );
+              taskOutcome = "success";
+              if (step < MAX_LOOP_STEPS) {
+                await waitAfterNavigatingAction(tabId);
+              }
+              break;
+            }
+
+            actionMightNavigate = true;
+          }
         }
       } else {
         appendLog("\nStopping loop - no actionable response returned.");

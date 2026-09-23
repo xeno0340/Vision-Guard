@@ -17,6 +17,7 @@ testing/results.json
 testing/annotation.csv
 testing/debug-screenshots/
 debug/screenshots/
+firefox-testing-profile/
 # OS / editor
 .DS_Store
 Thumbs.db
